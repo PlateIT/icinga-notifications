@@ -8,8 +8,13 @@ the steps for each of them.
 
 ## Database Schema Upgrades
 
-Certain Icinga Notifications version upgrades require a database schema upgrade. If the upgrade section of the specific Icinga Notifications
-release mentions a schema upgrade, this section will guide you through the process of applying the schema upgrade.
+Icinga Notifications applies supported database schema upgrades automatically
+when the daemon starts. Before upgrading, back up the database and then install
+and start the new version normally. The daemon refuses to start if it encounters
+an unknown schema version or if no complete migration path is available.
+
+The manual instructions below apply only to older releases whose release notes
+explicitly require a manual schema upgrade.
 
 First, stop the Icinga Notifications daemon.
 

@@ -23,7 +23,8 @@ or install [from source](02-Installation.md.d/From-Source.md).
 
 A MySQL (≥5.7.22), MariaDB (≥10.5.0), or PostgreSQL (≥9.6) database is required to run Icinga Notifications.
 Please follow the steps listed for your target database,
-which guide you through setting up the database and user and importing the schema.
+which guide you through setting up the database and user. Icinga Notifications
+initializes the schema automatically when it first connects to an empty database.
 
 ### Setting up a MySQL or MariaDB Database
 
@@ -35,12 +36,6 @@ Set up a MySQL database for Icinga Notifications:
 CREATE DATABASE notifications;
 CREATE USER 'notifications'@'localhost' IDENTIFIED BY 'CHANGEME';
 GRANT ALL ON notifications.* TO 'notifications'@'localhost';
-```
-
-After creating the database, import the Icinga Notifications schema using the following command:
-
-```
-mysql -u root -p notifications < /usr/share/icinga-notifications/schema/mysql/schema.sql
 ```
 
 ### Setting up a PostgreSQL Database
@@ -66,12 +61,6 @@ host  all notifications      ::/0 md5
 ```
 
 To apply these changes, run `systemctl reload postgresql`.
-
-After creating the database, import the Icinga Notifications schema using the following command:
-
-```
-psql -U notifications notifications < /usr/share/icinga-notifications/schema/pgsql/schema.sql
-```
 
 ## Configuring Icinga Notifications
 

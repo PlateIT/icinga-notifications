@@ -21,6 +21,7 @@ import (
 	"github.com/icinga/icinga-notifications/internal/listener"
 	"github.com/icinga/icinga-notifications/internal/retention"
 	"github.com/icinga/icinga-notifications/internal/source"
+	"github.com/icinga/icinga-notifications/schema"
 	"github.com/okzk/sdnotify"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -64,8 +65,8 @@ func run() int {
 		logger.Fatalf("Cannot connect to the database: %+v", err)
 	}
 
-	if err := internal.CheckSchema(ctx, db); err != nil {
-		logger.Fatalf("%+v", err)
+	if err := schema.Ensure(ctx, db); err != nil {
+		logger.Fatalf("Cannot initialize or update database schema: %+v", err)
 	}
 
 	if err := source.SyncConfigured(ctx, db, conf.Source, logger); err != nil {
