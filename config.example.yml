@@ -5,6 +5,18 @@ icingaweb2_url: http://localhost/icingaweb2/
 # By default, all of Icinga Notifications built-in channel plugins are installed in the directory below.
 #channels_dir: /usr/libexec/icinga-notifications/channels
 
+# Optional source bootstrap configuration.
+# When set, the daemon creates or updates these source entries in the database on startup.
+#source:
+#  - type: icingadb
+#    name: Icinga DB
+#    username: icingadb
+#    password_file: /run/secrets/icinga_notifications_icingadb_source_password
+#  - type: icinga-kubernetes
+#    name: Icinga for Kubernetes
+#    username: icinga-kubernetes
+#    password_file: /run/secrets/icinga_notifications_icinga_kubernetes_source_password
+
 # Icinga Notifications HTTP listener configuration.
 listener:
   # The TCP address of the Icinga Notifications HTTP listener to listen on, in the form of "host:port".

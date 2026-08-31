@@ -20,6 +20,7 @@ import (
 	"github.com/icinga/icinga-notifications/internal/incident"
 	"github.com/icinga/icinga-notifications/internal/listener"
 	"github.com/icinga/icinga-notifications/internal/retention"
+	"github.com/icinga/icinga-notifications/internal/source"
 	"github.com/okzk/sdnotify"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -65,6 +66,10 @@ func run() int {
 
 	if err := internal.CheckSchema(ctx, db); err != nil {
 		logger.Fatalf("%+v", err)
+	}
+
+	if err := source.SyncConfigured(ctx, db, conf.Source, logger); err != nil {
+		logger.Fatalf("Failed to synchronize configured source: %+v", err)
 	}
 
 	channel.UpsertPlugins(ctx, conf.ChannelsDir, logs.GetChildLogger("channel"), db)
