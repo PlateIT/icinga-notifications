@@ -1,6 +1,11 @@
 # Icinga Notifications | (c) 2023 Icinga GmbH | GPLv2+
 
-FROM docker.io/library/golang AS build
+FROM bit-base-images-docker-hosted.nexus.bit.admin.ch/bit/ca-bundle:latest AS certs
+FROM docker-hub.nexus.bit.admin.ch/library/golang AS build
+
+COPY --from=certs /certs/ /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
 ENV CGO_ENABLED=0
 COPY . /src/icinga-notifications
 WORKDIR /src/icinga-notifications
@@ -11,16 +16,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 RUN make DESTDIR=/target install
 
-FROM docker.io/library/alpine
+FROM docker-hub.nexus.bit.admin.ch/library/alpine
+
+COPY --from=certs /certs/ /usr/local/share/ca-certificates/
+RUN cat /usr/local/share/ca-certificates/*.crt >> /etc/ssl/certs/ca-certificates.crt
 
 COPY --from=build /target /
+COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
 
-RUN apk add tzdata
-
-ARG username=notifications
-RUN addgroup -g 1000 $username
-RUN adduser -u 1000 -H -D -G $username $username
-USER $username
+RUN chown -R 0:0 /etc/icinga-notifications /usr/libexec/icinga-notifications /usr/share/icinga-notifications && \
+    chmod -R g=u /etc/icinga-notifications /usr/libexec/icinga-notifications /usr/share/icinga-notifications
 
 EXPOSE 5680
 CMD ["/usr/sbin/icinga-notifications"]
