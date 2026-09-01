@@ -143,7 +143,7 @@ retention:
     #channel:
     #database:
     #incident:
-    #event-queue:
+    #job-queue:
     #listener:
     #retention:
     #runtime-updates:
