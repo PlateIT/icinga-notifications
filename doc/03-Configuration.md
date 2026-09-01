@@ -60,6 +60,9 @@ For environment variables, each source entry is indexed below the `ICINGA_NOTIFI
 `password` or `password_file` must be set for each configured source.
 The password is stored as a bcrypt hash in the database.
 Each configured source must use a unique `username`.
+The synchronization is idempotent across HA replicas: concurrent startup may
+race on the initial insert, but every replica continues with the same
+authoritative row and verifies or updates it instead of requiring a restart.
 
 ```yaml
 # YAML Configuration File
