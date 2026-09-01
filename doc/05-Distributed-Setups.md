@@ -11,8 +11,12 @@ When an event is received via the [HTTP API](20-HTTP-API.md),
 the receiving instance writes it to a queue table in the database rather than processing it immediately.
 A background worker in each instance continuously polls this queue and claims events for processing.
 
-The database ensures that each event is processed exactly once across all running instances.
-There is no leader election; all instances are equal and contribute to the shared workload.
+The database ensures that a queue entry and all entries for the same target object are claimed by at most one
+instance at a time. Completed entries remain for a bounded retention period to deduplicate immediate resubmissions.
+If an instance fails after an external side effect but before it can atomically finalize the queue entry, the orphaned
+claim is reset and may be processed again. Processing therefore has at-least-once crash semantics and channel
+integrations must use idempotency where their remote protocol supports it. There is no leader election; all instances
+are equal and contribute to the shared workload.
 
 Although database queries ensure that no two instances operate on identical objects, submission time is important.
 Therefore, ensure that all nodes have identical system times, e.g., via NTP.
