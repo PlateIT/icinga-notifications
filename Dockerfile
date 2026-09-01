@@ -19,7 +19,8 @@ RUN make DESTDIR=/target install
 FROM docker-hub.nexus.bit.admin.ch/library/alpine
 
 COPY --from=certs /certs/ /usr/local/share/ca-certificates/
-RUN cat /usr/local/share/ca-certificates/*.crt >> /etc/ssl/certs/ca-certificates.crt
+RUN apk upgrade --no-cache && \
+    cat /usr/local/share/ca-certificates/*.crt >> /etc/ssl/certs/ca-certificates.crt
 
 COPY --from=build /target /
 COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
