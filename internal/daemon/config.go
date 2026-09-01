@@ -127,13 +127,15 @@ func (l *Listener) GetTlsConfig() (*tls.Config, *config.CrlChecker, bool, error)
 }
 
 type ConfigFile struct {
-	ChannelsDir   string          `yaml:"channels_dir" env:"CHANNELS_DIR"`
-	Icingaweb2URL string          `yaml:"icingaweb2_url" env:"ICINGAWEB2_URL"`
-	Listener      Listener        `yaml:"listener" envPrefix:"LISTENER_"`
-	Source        []source.Config `yaml:"source" envPrefix:"SOURCE_"`
-	Database      database.Config `yaml:"database" envPrefix:"DATABASE_"`
-	Retention     Retention       `yaml:"retention" envPrefix:"RETENTION_"`
-	Logging       logging.Config  `yaml:"logging" envPrefix:"LOGGING_"`
+	ChannelsDir        string          `yaml:"channels_dir" env:"CHANNELS_DIR"`
+	Icingaweb2URL      string          `yaml:"icingaweb2_url" env:"ICINGAWEB2_URL"`
+	Listener           Listener        `yaml:"listener" envPrefix:"LISTENER_"`
+	Source             []source.Config `yaml:"source" envPrefix:"SOURCE_"`
+	Database           database.Config `yaml:"database" envPrefix:"DATABASE_"`
+	DatabaseAutoImport bool            `yaml:"database_auto_import" env:"DATABASE_AUTO_IMPORT"`
+	DatabaseSchemaDir  string          `yaml:"database_schema_dir" env:"DATABASE_SCHEMA_DIR"`
+	Retention          Retention       `yaml:"retention" envPrefix:"RETENTION_"`
+	Logging            logging.Config  `yaml:"logging" envPrefix:"LOGGING_"`
 
 	// IcingaWeb2UrlParsed holds the parsed Icinga Web 2 URL after validation of the config file.
 	//
@@ -146,6 +148,9 @@ type ConfigFile struct {
 func (c *ConfigFile) SetDefaults() {
 	if defaults.CanUpdate(c.ChannelsDir) {
 		c.ChannelsDir = internal.LibExecDir + "/icinga-notifications/channels"
+	}
+	if defaults.CanUpdate(c.DatabaseSchemaDir) {
+		c.DatabaseSchemaDir = "/usr/share/icinga-notifications/schema"
 	}
 }
 

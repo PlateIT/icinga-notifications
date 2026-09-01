@@ -19,6 +19,15 @@ the module name in uppercase followed by an underscore, and the option name in u
 The hyphens in the names are to be replaced by underscores.
 For example, to set the database host, the `ICINGA_NOTIFICATIONS_DATABASE_HOST` environment variable is used.
 
+For containerized greenfield installations, `ICINGA_NOTIFICATIONS_DATABASE_AUTO_IMPORT=true`
+initializes a completely empty database from the schema below
+`ICINGA_NOTIFICATIONS_DATABASE_SCHEMA_DIR` (default:
+`/usr/share/icinga-notifications/schema`). It never upgrades an existing
+schema; upgrades remain an explicit operator action.
+Initialization is serialized in the database, so multiple HA replicas may
+start concurrently. PostgreSQL uses a transaction-scoped advisory lock;
+MySQL/MariaDB uses a dedicated connection with a named session lock.
+
 Passwords can be set directly or stored in a separate file, referenced via the `password_file` YAML key or `PASSWORD_FILE` environment variable.
 Only one of these two options can be used.
 

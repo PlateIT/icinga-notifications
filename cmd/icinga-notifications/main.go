@@ -66,7 +66,18 @@ func run() int {
 	}
 
 	if err := internal.CheckSchema(ctx, db); err != nil {
-		logger.Fatalf("%+v", err)
+		if !errors.Is(err, internal.ErrSchemaNotExists) || !conf.DatabaseAutoImport {
+			logger.Fatalf("%+v", err)
+		}
+
+		logger.Info("Initializing empty notifications database")
+		if err := internal.ImportSchema(ctx, db, conf.DatabaseSchemaDir); err != nil {
+			logger.Fatalf("Cannot initialize notifications database: %+v", err)
+		}
+		if err := internal.CheckSchema(ctx, db); err != nil {
+			logger.Fatalf("Initialized notifications database failed schema validation: %+v", err)
+		}
+		logger.Info("Notifications database initialized successfully")
 	}
 
 	if err := source.SyncConfigured(ctx, db, conf.Source, logger); err != nil {
