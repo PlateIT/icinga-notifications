@@ -20,8 +20,8 @@ FROM docker-hub.nexus.bit.admin.ch/library/alpine
 
 COPY --from=certs /certs/ /usr/local/share/ca-certificates/
 RUN cat /usr/local/share/ca-certificates/*.crt >> /etc/ssl/certs/ca-certificates.crt && \
-    apk upgrade --no-cache && \
-    update-ca-certificates
+    update-ca-certificates && \
+    apk upgrade --no-cache
 
 COPY --from=build /target /
 COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
