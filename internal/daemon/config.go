@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"os/user"
 	"strconv"
@@ -128,7 +127,6 @@ func (l *Listener) GetTlsConfig() (*tls.Config, *config.CrlChecker, bool, error)
 
 type ConfigFile struct {
 	ChannelsDir        string          `yaml:"channels_dir" env:"CHANNELS_DIR"`
-	Icingaweb2URL      string          `yaml:"icingaweb2_url" env:"ICINGAWEB2_URL"`
 	Listener           Listener        `yaml:"listener" envPrefix:"LISTENER_"`
 	Source             []source.Config `yaml:"source" envPrefix:"SOURCE_"`
 	Database           database.Config `yaml:"database" envPrefix:"DATABASE_"`
@@ -136,12 +134,6 @@ type ConfigFile struct {
 	DatabaseSchemaDir  string          `yaml:"database_schema_dir" env:"DATABASE_SCHEMA_DIR"`
 	Retention          Retention       `yaml:"retention" envPrefix:"RETENTION_"`
 	Logging            logging.Config  `yaml:"logging" envPrefix:"LOGGING_"`
-
-	// IcingaWeb2UrlParsed holds the parsed Icinga Web 2 URL after validation of the config file.
-	//
-	// This field is not part of the YAML config and is only populated after successful validation.
-	// The resulting URL always ends with a trailing slash, making it easier to resolve relative paths against it.
-	IcingaWeb2UrlParsed *url.URL
 }
 
 // SetDefaults implements the defaults.Setter interface.
@@ -173,39 +165,25 @@ func (c *ConfigFile) Validate() error {
 		return err
 	}
 
-	if c.Icingaweb2URL == "" {
-		return errors.New("icingaweb2_url must be set")
-	}
-
-	parsedUrl, err := url.Parse(c.Icingaweb2URL)
-	if err != nil {
-		return fmt.Errorf("invalid icingaweb2_url: %w", err)
-	}
-
-	if !parsedUrl.IsAbs() {
-		return errors.New("icingaweb2_url must be an absolute URL")
-	}
-
-	parsedUrl.RawQuery = "" // Ignore query params if provided, as they are not relevant for resolving event URLs
-	// Ensure the URL ends with a trailing slash for easier resolution of relative paths.
-	c.IcingaWeb2UrlParsed = parsedUrl.JoinPath("/")
-
 	return nil
 }
 
 // RetentionOpts defines additional overrides for retention periods of specific components.
 //
-// Currently, we only have a single component (incidents), but this leaves room for future expansion
-// without breaking the config structure. The fields here must be pointers to distinguish between
-// "not set" and "set to zero" (i.e. no retention) when overriding the default retention period.
+// The fields here must be pointers to distinguish between "not set" and "set to zero" (i.e. no retention)
+// when overriding the default retention period.
 type RetentionOpts struct {
-	Incident *time.Duration `yaml:"incident" env:"INCIDENT"`
+	Incident            *time.Duration `yaml:"incident" env:"INCIDENT"`
+	NotificationHistory *time.Duration `yaml:"notification_history" env:"NOTIFICATION_HISTORY"`
 }
 
 // Validate implements the [config.Validator] interface.
 func (r *RetentionOpts) Validate() error {
 	if r.Incident != nil && *r.Incident < 0 {
 		return errors.New("invalid retention period for incidents")
+	}
+	if r.NotificationHistory != nil && *r.NotificationHistory < 0 {
+		return errors.New("invalid retention period for notification history")
 	}
 	return nil
 }

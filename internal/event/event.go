@@ -2,7 +2,6 @@ package event
 
 import (
 	"fmt"
-	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -32,28 +31,6 @@ type Event struct {
 	// This is used to avoid evaluating the same JSONPath expression multiple times during rule evaluation of an event,
 	// as the same filter column can be used in multiple conditions of a rule or even multiple event rules.
 	evaluatedRelations map[string]jsonpath.NodeList
-}
-
-// CompleteURL returns the complete URL for this event by combining the Icinga Web 2 URL with the event's own url field.
-//
-// If the event's url field is an absolute URL, is empty, or it can't be URL parsed, then this method is a no-op.
-// Otherwise, it is resolved against the provided Icinga Web 2 URL to form a complete URL.
-func (e *Event) CompleteURL(icingaWebBaseUrl *url.URL) {
-	if e.URL == "" {
-		return
-	}
-
-	u, err := url.Parse(strings.TrimLeft(e.URL, "/"))
-	if err != nil {
-		return // leave it as is if it cannot be parsed as a URL
-	}
-
-	if !u.IsAbs() {
-		// Actually, the Icinga Web 2 base url should always contain the trailing slash, but just in
-		// case it doesn't, make sure to add it before resolving the event URL against it to avoid
-		// losing the last path segment of the base url.
-		e.URL = icingaWebBaseUrl.JoinPath("/").ResolveReference(u).String()
-	}
 }
 
 // Validate validates the current event state.
