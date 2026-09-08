@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/icinga/icinga-go-library/backoff"
@@ -51,7 +52,8 @@ func (pc prunerCommon) assembleDeleteByPK() string {
 // accordingly.
 type TimeBoundPruner struct {
 	prunerCommon
-	TimeColumn string
+	IsPKorFKUUID bool
+	TimeColumn   string
 
 	Referrers      []ReferencingRowPruner
 	ExtraCondition string
@@ -64,7 +66,6 @@ func (tbp *TimeBoundPruner) TableName() string { return tbp.Table }
 func (tbp *TimeBoundPruner) IntervalAndPeriodOverrides() time.Duration {
 	return tbp.OverridePeriodAndInterval
 }
-func (tbp *TimeBoundPruner) referrers() []ReferencingRowPruner { return tbp.Referrers }
 
 // Exec prunes rows from the specified table that are older than the given time threshold.
 //
@@ -91,6 +92,11 @@ func (tbp *TimeBoundPruner) Exec(ctx context.Context, db *database.DB, l *loggin
 	)
 	return deleted, err
 }
+
+func (tbp *TimeBoundPruner) referrers() []ReferencingRowPruner { return tbp.Referrers }
+
+// pkIsUUID reports whether PKorFK is a UUID column, requiring special scan handling in execCascade.
+func (tbp *TimeBoundPruner) pkIsUUID() bool { return tbp.IsPKorFKUUID }
 
 // whereClause returns the additional WHERE with an AND from WhereCondition, if set, or an empty string otherwise.
 func (tbp *TimeBoundPruner) whereClause() string {
@@ -119,9 +125,10 @@ func (tbp *TimeBoundPruner) assembleDelete(driverName string, limit uint64) stri
 			tbp.Table, tbp.TimeColumn, tbp.whereClause(), limit)
 	case database.PostgreSQL:
 		return fmt.Sprintf(`
-			WITH rows AS (SELECT %[1]s FROM %[2]s WHERE %[3]s IS NOT NULL AND %[3]s < ? %[4]s LIMIT %[5]d)
-			DELETE FROM %[2]s WHERE %[1]s IN (SELECT * FROM rows)`,
-			tbp.PKorFK, tbp.Table, tbp.TimeColumn, tbp.whereClause(), limit)
+			WITH rows_to_delete AS (%s)
+			DELETE FROM %s
+			WHERE %s IN (SELECT * FROM rows_to_delete)`,
+			tbp.assembleSelect(limit), tbp.Table, tbp.PKorFK)
 	default:
 		panic(fmt.Sprintf("invalid database type %s", driverName))
 	}
@@ -130,9 +137,6 @@ func (tbp *TimeBoundPruner) assembleDelete(driverName string, limit uint64) stri
 // ResetPruner is a specific TimeBoundPruner for updating affected rows instead of deleting them.
 //
 // The UpdateExpression is used in the UPDATE query after "UPDATE __TABLE__ SET " and must be one or many assignments.
-//
-// As the ResetPruner does not delete, it is not allowed to refer other tables. If ResetPruner.Referrers is not empty,
-// the Exec method will panic.
 type ResetPruner struct {
 	TimeBoundPruner
 	UpdateExpression string
@@ -141,17 +145,22 @@ type ResetPruner struct {
 // Exec prunes rows from the specified table that are older than the given time threshold.
 //
 // The ResetPruner understands pruning as a UPDATE query, which should alter the row to not be matched again.
+// If Referrers are defined, it will remove the matching rows atomically in a transaction.
 func (rp *ResetPruner) Exec(ctx context.Context, db *database.DB, l *logging.Logger, olderThan types.UnixMilli, limit uint64) (uint64, error) {
-	if len(rp.Referrers) != 0 {
-		panic("ResetPruner is not allowed to refer other tables")
-	}
-
 	var updated uint64
 	err := retry.WithBackoff(
 		ctx,
 		func(ctx context.Context) (err error) {
-			updated, err = exec(ctx, db, db, rp.assembleUpdate(db.DriverName(), limit), limit, olderThan)
-			return
+			if len(rp.Referrers) == 0 {
+				updated, err = exec(ctx, db, db, rp.assembleUpdate(db.DriverName(), limit), limit, olderThan)
+				return
+			}
+
+			// A tx is required here to ensure that the updates to the main table and its referrers are executed atomically.
+			return db.ExecTx(ctx, nil, func(ctx context.Context, tx *sqlx.Tx) (err error) {
+				updated, err = execCascade(ctx, db, tx, rp, limit, olderThan)
+				return
+			})
 		},
 		retry.Retryable,
 		backoff.DefaultBackoff,
@@ -176,29 +185,39 @@ func (rp *ResetPruner) assembleUpdate(driverName string, limit uint64) string {
 	}
 }
 
+// assembleUpdateByPk constructs an update statement for the ResetPruner filtered by primary key.
+func (rp *ResetPruner) assembleUpdateByPk() string {
+	return fmt.Sprintf(`UPDATE %[1]s SET %[2]s WHERE %[3]s IN (?)`, rp.Table, rp.UpdateExpression, rp.PKorFK)
+}
+
+// ReferencingRelation identifies a table and foreign key column that may reference another table's primary key.
+type ReferencingRelation struct {
+	Table string // The name of the table that references this table's primary key.
+	FK    string // The name of the foreign key column in the referencing table that points to this table's primary key.
+}
+
 // OrphanRowPruner defines the configuration for pruning rows from a table that are not referenced by any other table.
 //
 // This struct is used to identify and delete orphaned rows based on the primary key of the main table and the
-// foreign key of the referencing table. Currently, it only supports a single referencing table, but it can be
-// extended to support multiple referencing tables in the future if needed.
+// foreign key columns of the referencing tables. A row is only considered orphaned, and thus eligible for deletion,
+// if none of the configured ReferencedBy relations reference it.
 type OrphanRowPruner struct {
 	prunerCommon
-	ReferencingTable string // The name of the table that references this table's primary key.
-	ReferencingFK    string // The name of the foreign key column in the referencing table that points to this table's primary key.
-	Interval         time.Duration
+	IsPKorFKUUID bool
+	ReferencedBy []ReferencingRelation // Tables that may still reference this table's primary key.
+	Interval     time.Duration
 
 	// Referrers is a list of tables that reference this table's primary key, allowing for cascading deletes to
 	// maintain referential integrity.
 	//
-	// This must not be confused with the ReferencingTable and ReferencingFK fields, which are used to identify
-	// orphaned rows based on a single referencing table. This field allows for additional tables to be pruned
-	// in a cascading manner, ensuring that any related rows are also deleted.
+	// This must not be confused with the ReferencedBy field, which is used to identify orphaned rows based on
+	// whether any referencing table still has a row pointing at them. This field allows for additional tables to
+	// be pruned in a cascading manner, ensuring that any related rows are also deleted.
 	Referrers []ReferencingRowPruner
 }
 
 func (orp *OrphanRowPruner) TableName() string                         { return orp.Table }
 func (orp *OrphanRowPruner) IntervalAndPeriodOverrides() time.Duration { return orp.Interval }
-func (orp *OrphanRowPruner) referrers() []ReferencingRowPruner         { return orp.Referrers }
 
 // Exec prunes rows from the specified table that are not referenced by any other table.
 //
@@ -249,38 +268,52 @@ func (orp *OrphanRowPruner) Exec(ctx context.Context, db *database.DB, l *loggin
 	}
 }
 
+func (orp *OrphanRowPruner) referrers() []ReferencingRowPruner { return orp.Referrers }
+
+// pkIsUUID reports whether PKorFK is a UUID column, requiring special scan handling in execCascade.
+func (orp *OrphanRowPruner) pkIsUUID() bool { return orp.IsPKorFKUUID }
+
+// joinList constructs the JOIN and WHERE clauses for the OrphanRowPruner based on the ReferencedBy relations.
+func (orp *OrphanRowPruner) joinList() (string, string) {
+	var joinList, condList []string
+	for _, rel := range orp.ReferencedBy {
+		alias := fmt.Sprintf("%s_ref", rel.Table)
+		joinList = append(joinList, fmt.Sprintf(
+			"LEFT JOIN %[1]s %[2]s ON %[2]s.%[3]s = main.%[4]s", rel.Table, alias, rel.FK, orp.PKorFK,
+		))
+		condList = append(condList, fmt.Sprintf("%s.%s IS NULL", alias, rel.FK))
+	}
+	return strings.Join(joinList, " "), strings.Join(condList, " AND ")
+}
+
 // assembleSelect constructs a select statement to retrieve primary keys of the OrphanRowPruner.
 func (orp *OrphanRowPruner) assembleSelect(limit uint64) string {
+	joins, conds := orp.joinList()
 	return fmt.Sprintf(`
-		SELECT main.%[2]s
-		FROM %[1]s main
-			LEFT JOIN %[3]s ref ON ref.%[4]s = main.%[2]s
-		WHERE ref.%[4]s IS NULL
-		LIMIT %[5]d`,
-		orp.Table, orp.PKorFK, orp.ReferencingTable, orp.ReferencingFK, limit)
+		SELECT main.%s
+		FROM %s main
+			%s
+		WHERE %s
+		LIMIT %d`,
+		orp.PKorFK, orp.Table, joins, conds, limit)
 }
 
 // assembleDelete constructs a delete statement for the OrphanRowPruner based on the database driver and limit.
 func (orp *OrphanRowPruner) assembleDelete(driverName string, limit uint64) string {
 	switch driverName {
 	case database.MySQL:
+		joins, conds := orp.joinList()
 		// MariaDB does support JOIN based ANTI-JOINs but doesn't support LIMIT in DELETE statements with JOINs
-		// on older versions, so we have to use a subquery instead. However, this might yield unexpected results
-		// if the configured foreign key is nullable on the referencing table.
+		// on older versions, so we have to use a subquery instead.
 		return fmt.Sprintf(
-			`DELETE FROM %[1]s WHERE %[2]s NOT IN (SELECT %[4]s FROM %[3]s) LIMIT %[5]d`,
-			orp.Table, orp.PKorFK, orp.ReferencingTable, orp.ReferencingFK, limit)
+			`DELETE FROM %[1]s WHERE %[2]s IN (SELECT main.%[2]s FROM %[1]s main %[3]s WHERE %[4]s) LIMIT %[5]d`,
+			orp.Table, orp.PKorFK, joins, conds, limit)
 	case database.PostgreSQL:
 		return fmt.Sprintf(`
- 			WITH rows AS (
-				SELECT main.%[2]s
-				FROM %[1]s main
-					LEFT JOIN %[3]s ref ON ref.%[4]s = main.%[2]s
-				WHERE ref.%[4]s IS NULL
-				LIMIT %[5]d
-			)
-			DELETE FROM %[1]s WHERE %[2]s IN (SELECT * FROM rows)`,
-			orp.Table, orp.PKorFK, orp.ReferencingTable, orp.ReferencingFK, limit)
+			WITH rows_to_delete AS (%s)
+			DELETE FROM %s
+			WHERE %s IN (SELECT * FROM rows_to_delete)`,
+			orp.assembleSelect(limit), orp.Table, orp.PKorFK)
 	default:
 		panic(fmt.Sprintf("invalid database type %s", driverName))
 	}
@@ -352,10 +385,14 @@ func exec(ctx context.Context, db *database.DB, executer database.TxOrDB, query 
 // each [ReferencingRowPruner], and then deletes the rows from the main table by primary key. If the SELECT statement
 // requires any bind arguments (e.g. an "olderThan" threshold), they must be provided via args.
 //
+// Note that when the pruner provides a assembleUpdateByPk() method (e.g. [ResetPruner]), the main table is
+// updated instead of deleted, and the method will return the total number of updated rows from the main table.
+//
 // The method returns the total number of deleted rows from the main table.
 func execCascade[
 	P interface {
 		referrers() []ReferencingRowPruner
+		pkIsUUID() bool
 		assembleSelect(uint64) string
 		assembleDeleteByPK() string
 	},
@@ -368,13 +405,33 @@ func execCascade[
 	args ...any,
 ) (uint64, error) {
 	selectStmt := pruner.assembleSelect(limit)
-	deleteStmt := pruner.assembleDeleteByPK()
+	var deleteOrUpdateStmt string
+	if updater, ok := any(pruner).(interface{ assembleUpdateByPk() string }); ok {
+		deleteOrUpdateStmt = updater.assembleUpdateByPk()
+	} else {
+		deleteOrUpdateStmt = pruner.assembleDeleteByPK()
+	}
 
 	var total uint64
 	for {
 		var rows []any
-		if err := sqlx.SelectContext(ctx, executer, &rows, db.Rebind(selectStmt), args...); err != nil {
-			return 0, database.CantPerformQuery(err, selectStmt)
+		if pruner.pkIsUUID() {
+			// UUID columns can't be scanned into `any` safely as the driver's default representation for that
+			// case doesn't round-trip cleanly when it's rebound as a parameter in the DELETE/UPDATE statements
+			// below. types.UUID implements sql.Scanner/driver.Valuer and marshals itself the same way for both
+			// supported drivers, so route UUID PKs/FKs through it explicitly instead.
+			var uuids []types.UUID
+			if err := sqlx.SelectContext(ctx, executer, &uuids, db.Rebind(selectStmt), args...); err != nil {
+				return 0, database.CantPerformQuery(err, selectStmt)
+			}
+			rows = make([]any, len(uuids))
+			for i, u := range uuids {
+				rows[i] = u
+			}
+		} else {
+			if err := sqlx.SelectContext(ctx, executer, &rows, db.Rebind(selectStmt), args...); err != nil {
+				return 0, database.CantPerformQuery(err, selectStmt)
+			}
 		}
 
 		if len(rows) == 0 {
@@ -387,7 +444,7 @@ func execCascade[
 			}
 		}
 
-		if affected, err := exec(ctx, db, executer, deleteStmt, 0, rows...); err != nil {
+		if affected, err := exec(ctx, db, executer, deleteOrUpdateStmt, 0, rows...); err != nil {
 			return 0, err
 		} else {
 			total += affected

@@ -17,6 +17,7 @@ type configuredRow struct {
 	Type                 string         `db:"type"`
 	Name                 string         `db:"name"`
 	ListenerPasswordHash sql.NullString `db:"listener_password_hash"`
+	Deleted              string         `db:"deleted"`
 }
 
 func SyncConfigured(ctx context.Context, db *database.DB, config []Config, logger *logging.Logger) error {
@@ -45,12 +46,18 @@ func syncConfigured(ctx context.Context, db *database.DB, source Config, logger 
 		stmt := db.Rebind(`
 			INSERT INTO "source" ("type", "name", "listener_username", "listener_password_hash", "changed_at")
 			VALUES (?, ?, ?, ?, ?)`)
-		if _, err := db.ExecContext(ctx, stmt, source.Type, source.Name, source.Username, string(hash), now); err != nil {
-			return fmt.Errorf("can't create configured source %q: %w", source.Username, err)
+		if _, insertErr := db.ExecContext(ctx, stmt, source.Type, source.Name, source.Username, string(hash), now); insertErr != nil {
+			// All HA replicas perform the same declarative bootstrap. If another
+			// replica won the unique listener_username insert, continue with the
+			// regular comparison/update path instead of forcing a pod restart.
+			existing, err = getConfigured(ctx, db, source.Username)
+			if err != nil || existing == nil {
+				return fmt.Errorf("can't create configured source %q: %w", source.Username, insertErr)
+			}
+		} else {
+			logger.Infow("Created configured source", zap.String("source", source.Name), zap.String("username", source.Username))
+			return nil
 		}
-
-		logger.Infow("Created configured source", zap.String("source", source.Name), zap.String("username", source.Username))
-		return nil
 	}
 
 	passwordHash := existing.ListenerPasswordHash.String
@@ -64,7 +71,7 @@ func syncConfigured(ctx context.Context, db *database.DB, source Config, logger 
 		passwordHash = string(hash)
 	}
 
-	if existing.Type == source.Type && existing.Name == source.Name && existing.ListenerPasswordHash.Valid &&
+	if existing.Deleted == "n" && existing.Type == source.Type && existing.Name == source.Name && existing.ListenerPasswordHash.Valid &&
 		existing.ListenerPasswordHash.String == passwordHash {
 		logger.Debugw("Configured source already up to date", zap.String("source", source.Name), zap.String("username", source.Username))
 		return nil
@@ -72,7 +79,7 @@ func syncConfigured(ctx context.Context, db *database.DB, source Config, logger 
 
 	stmt := db.Rebind(`
 		UPDATE "source"
-		SET "type" = ?, "name" = ?, "listener_password_hash" = ?, "changed_at" = ?
+		SET "type" = ?, "name" = ?, "listener_password_hash" = ?, "changed_at" = ?, "deleted" = 'n'
 		WHERE "id" = ?`)
 	if _, err := db.ExecContext(ctx, stmt, source.Type, source.Name, passwordHash, now, existing.ID); err != nil {
 		return fmt.Errorf("can't update configured source %q: %w", source.Username, err)
@@ -84,9 +91,9 @@ func syncConfigured(ctx context.Context, db *database.DB, source Config, logger 
 
 func getConfigured(ctx context.Context, db *database.DB, username string) (*configuredRow, error) {
 	stmt := db.Rebind(`
-		SELECT "id", "type", "name", "listener_password_hash"
+		SELECT "id", "type", "name", "listener_password_hash", "deleted"
 		FROM "source"
-		WHERE "listener_username" = ? AND "deleted" = 'n'`)
+		WHERE "listener_username" = ?`)
 
 	var source configuredRow
 	if err := db.GetContext(ctx, &source, stmt, username); err != nil {

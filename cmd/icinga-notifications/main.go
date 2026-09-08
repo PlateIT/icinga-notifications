@@ -19,6 +19,7 @@ import (
 	"github.com/icinga/icinga-notifications/internal/event"
 	"github.com/icinga/icinga-notifications/internal/incident"
 	"github.com/icinga/icinga-notifications/internal/listener"
+	"github.com/icinga/icinga-notifications/internal/object"
 	"github.com/icinga/icinga-notifications/internal/retention"
 	"github.com/icinga/icinga-notifications/internal/source"
 	"github.com/okzk/sdnotify"
@@ -65,7 +66,18 @@ func run() int {
 	}
 
 	if err := internal.CheckSchema(ctx, db); err != nil {
-		logger.Fatalf("%+v", err)
+		if !errors.Is(err, internal.ErrSchemaNotExists) || !conf.DatabaseAutoImport {
+			logger.Fatalf("%+v", err)
+		}
+
+		logger.Info("Initializing empty notifications database")
+		if err := internal.ImportSchema(ctx, db, conf.DatabaseSchemaDir); err != nil {
+			logger.Fatalf("Cannot initialize notifications database: %+v", err)
+		}
+		if err := internal.CheckSchema(ctx, db); err != nil {
+			logger.Fatalf("Initialized notifications database failed schema validation: %+v", err)
+		}
+		logger.Info("Notifications database initialized successfully")
 	}
 
 	if err := source.SyncConfigured(ctx, db, conf.Source, logger); err != nil {
@@ -133,12 +145,10 @@ func run() int {
 	}
 
 	eg.Go(func() error {
-		logger := logs.GetChildLogger("event-queue")
-		err := event.ProcessQueue(
-			ctx,
-			db,
-			logger,
-			func(ctx context.Context, ev *event.Event) error {
+		logger := logs.GetChildLogger("job-queue")
+		cbs := event.QueueCallbacks{
+			GenObjectID: object.ID,
+			ProcessEvent: func(ctx context.Context, ev *event.Event) error {
 				err := incident.ProcessEvent(ctx, db, logs, runtimeConfig, ev)
 				if errors.Is(err, incident.ErrSeverityChangeWithoutIncidentFlag) ||
 					errors.Is(err, incident.ErrOpenIncidentWithoutSeverity) {
@@ -148,8 +158,10 @@ func run() int {
 					return nil
 				}
 				return err
-			})
-		if err != nil && !errors.Is(err, context.Canceled) {
+			},
+		}
+
+		if err := event.ProcessQueue(ctx, db, logger, cbs); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Errorf("Event queue processor has finished with an error: %+v", err)
 			return err
 		}
