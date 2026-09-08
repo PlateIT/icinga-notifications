@@ -1,6 +1,3 @@
-# The base Icinga Web 2 URL being used as the base URL for all object, notification and event URLs.
-icingaweb2_url: http://localhost/icingaweb2/
-
 # Directory containing all executable Icinga Notifications channel plugins.
 # By default, all of Icinga Notifications built-in channel plugins are installed in the directory below.
 #channels_dir: /usr/libexec/icinga-notifications/channels
@@ -91,9 +88,17 @@ database:
   password: CHANGEME
 #  password_file: /run/secerets/icinga_notifications_database_password
 
+# Initialize a completely empty database from the schema shipped with the
+# application. Concurrent HA starts are serialized in the database. Existing
+# schemas are never upgraded implicitly.
+#database_auto_import: false
+
+# Root containing mysql/schema.sql and pgsql/schema.sql for auto import.
+#database_schema_dir: /usr/share/icinga-notifications/schema
+
 # The retention policy used by Icinga Notifications to determine how long no longer relevant historical data
-# is kept in the database before it is eligible for cleanup. Currently, this retention policy only applies to
-# closed incidents and related tables, but in the future it may be extended to other components as well.
+# is kept in the database before it is eligible for cleanup. This retention policy applies to closed incidents,
+# notification history, and related tables.
 retention:
   # Retention period for historical data defined as duration string. This is the duration after which historical data
   # is considered old and eligible for cleanup. By default, Icinga Notifications does not automatically clean up any
@@ -119,6 +124,7 @@ retention:
   # above is used.
 #  options:
 #    incident: 480h
+#    notification_history: 4320h
 
 # Icinga Notifications logs its activities at various severity levels and any errors that occur either
 # on the console or in systemd's journal. The latter is used automatically when running under systemd.
@@ -143,7 +149,7 @@ retention:
     #channel:
     #database:
     #incident:
-    #event-queue:
+    #job-queue:
     #listener:
     #retention:
     #runtime-updates:

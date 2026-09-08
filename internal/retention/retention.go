@@ -45,6 +45,10 @@ func (r *Retention) Run(ctx context.Context) error {
 			period = *conf.Options.Incident
 		}
 
+		if pruner.TableName() == "notification_history" && conf.Options.NotificationHistory != nil {
+			period = *conf.Options.NotificationHistory
+		}
+
 		if d := pruner.IntervalAndPeriodOverrides(); d != 0 {
 			period = d
 			interval = d
@@ -115,9 +119,11 @@ var dbPruners = []Pruner{
 			Table:  "object",
 			PKorFK: "id",
 		},
-		ReferencingTable: "incident",
-		ReferencingFK:    "object_id",
-		Interval:         4 * time.Hour,
+		ReferencedBy: []ReferencingRelation{
+			{Table: "incident", FK: "object_id"},
+			{Table: "notification_history", FK: "object_id"},
+		},
+		Interval: 4 * time.Hour,
 		Referrers: []ReferencingRowPruner{
 			{Table: "object_id_tag", PKorFK: "object_id"},
 			{Table: "object_source", PKorFK: "object_id"},
@@ -137,13 +143,17 @@ var dbPruners = []Pruner{
 			{Table: "incident_rule_escalation_state", PKorFK: "incident_id"},
 		},
 	},
-	// Extra pruners for the event_queue.
+	// Extra pruners for the job_queue.
 	&ResetPruner{
 		TimeBoundPruner: TimeBoundPruner{
 			// Events being processed too long - implies crashed daemon.
 			prunerCommon: prunerCommon{
-				Table:  "event_queue",
+				Table:  "job_queue",
 				PKorFK: "id",
+			},
+			IsPKorFKUUID: true,
+			Referrers: []ReferencingRowPruner{
+				{Table: "job_processing_lock", PKorFK: "job_queue_id"},
 			},
 			TimeColumn:                "last_update",
 			ExtraCondition:            fmt.Sprintf("state = %d", event.QueueStateProcessing),
@@ -154,9 +164,10 @@ var dbPruners = []Pruner{
 	&TimeBoundPruner{
 		// Successfully processed events.
 		prunerCommon: prunerCommon{
-			Table:  "event_queue",
+			Table:  "job_queue",
 			PKorFK: "id",
 		},
+		IsPKorFKUUID:              true,
 		TimeColumn:                "last_update",
 		ExtraCondition:            fmt.Sprintf("state = %d", event.QueueStateDone),
 		OverridePeriodAndInterval: 5 * time.Minute,
@@ -164,11 +175,22 @@ var dbPruners = []Pruner{
 	&TimeBoundPruner{
 		// Events in the error state.
 		prunerCommon: prunerCommon{
-			Table:  "event_queue",
+			Table:  "job_queue",
 			PKorFK: "id",
 		},
+		IsPKorFKUUID:              true,
 		TimeColumn:                "last_update",
 		ExtraCondition:            fmt.Sprintf("state = %d", event.QueueStateError),
 		OverridePeriodAndInterval: 24 * time.Hour,
+	},
+	&TimeBoundPruner{
+		prunerCommon: prunerCommon{
+			Table:  "notification_history",
+			PKorFK: "id",
+		},
+		TimeColumn: "triggered_at",
+		Referrers: []ReferencingRowPruner{
+			{Table: "skipped_notification_history", PKorFK: "notification_history_id"},
+		},
 	},
 }

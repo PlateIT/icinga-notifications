@@ -19,6 +19,15 @@ the module name in uppercase followed by an underscore, and the option name in u
 The hyphens in the names are to be replaced by underscores.
 For example, to set the database host, the `ICINGA_NOTIFICATIONS_DATABASE_HOST` environment variable is used.
 
+For containerized greenfield installations, `ICINGA_NOTIFICATIONS_DATABASE_AUTO_IMPORT=true`
+initializes a completely empty database from the schema below
+`ICINGA_NOTIFICATIONS_DATABASE_SCHEMA_DIR` (default:
+`/usr/share/icinga-notifications/schema`). It never upgrades an existing
+schema; upgrades remain an explicit operator action.
+Initialization is serialized in the database, so multiple HA replicas may
+start concurrently. PostgreSQL uses a transaction-scoped advisory lock;
+MySQL/MariaDB uses a dedicated connection with a named session lock.
+
 Passwords can be set directly or stored in a separate file, referenced via the `password_file` YAML key or `PASSWORD_FILE` environment variable.
 Only one of these two options can be used.
 
@@ -26,11 +35,6 @@ Only one of these two options can be used.
 
 For YAML configuration, these options are on the top level, not part of a dictionary.
 For environment variables, each option is prefixed with `ICINGA_NOTIFICATIONS_`.
-
-### Icinga Web 2
-
-The `icingaweb2_url` is expected to point to the base directory of your Icinga Web 2 installation,
-i.e., `https://example.com/icingaweb2/`, to be used for URL creation.
 
 ### Channels Directory
 
@@ -60,6 +64,9 @@ For environment variables, each source entry is indexed below the `ICINGA_NOTIFI
 `password` or `password_file` must be set for each configured source.
 The password is stored as a bcrypt hash in the database.
 Each configured source must use a unique `username`.
+The synchronization is idempotent across HA replicas: concurrent startup may
+race on the initial insert, but every replica continues with the same
+authoritative row and verifies or updates it instead of requiring a restart.
 
 ```yaml
 # YAML Configuration File
@@ -109,7 +116,7 @@ For environment variables, each option is prefixed with `ICINGA_NOTIFICATIONS_LI
 | socket              | **Optional.** Path to a Unix domain socket for local event submission.                                     |
 | socket_mode         | **Optional.** Permission bits for the Unix socket file, as an octal. Defaults to `0660`.                   |
 | socket_group        | **Optional.** OS group to assign to the Unix socket file. Defaults to Icinga Notifications' primary group. |
-| debug_password      | Password expected via HTTP Basic Authentication for debug endpoints.                                       |
+| debug_password      | Password expected via [HTTP Basic Authentication](20-HTTP-API.md#authentication) for debug endpoints.      |
 | debug_password_file | `debug_password` in a file.                                                                                |
 | tls                 | **Optional.** Whether to require TLS for the TCP listener. Defaults to `false`.                            |
 | cert                | **Optional.** Path to TLS server certificate. Required if `tls` is enabled.                                |
@@ -199,8 +206,9 @@ data cleanup for that component.
 
 Also note that Icinga Notifications may still keep cleaning up data of some components that can't be influenced by the
 retention configuration, such as the `object` table and its related tables, which are cleaned up automatically when
-there are no more references to them from the `incident` table. This is necessary to avoid unnecessarily bloating
-the database with orphaned data that is no longer relevant to any incident.
+there are no more references to them from either the `incident` table or the `notification_history` table. This is
+necessary to avoid unnecessarily bloating the database with orphaned data that is no longer relevant to any incident
+or past notification attempt.
 
 ### Retention Components
 
@@ -214,9 +222,10 @@ a [duration string](#duration-string) as value.
 
 Currently, the following components are available:
 
-| Component | Description                                                           |
-|-----------|-----------------------------------------------------------------------|
-| incident  | Incidents and all related data, such as their history, contacts, etc. |
+| Component            | Description                                                             |
+|----------------------|-------------------------------------------------------------------------|
+| incident             | Incidents and all related data, such as their history, contacts, etc.   |
+| notification_history | Recorded notification attempts (sent or failed) and their skipped rows. |
 
 !!! info
 
@@ -272,7 +281,7 @@ ICINGA_NOTIFICATIONS_LOGGING_OPTIONS=database:error,listener:debug
 | channel         | Notification channels, their configuration and output.                    |
 | database        | Database connection status and queries.                                   |
 | incident        | Incident management and changes.                                          |
-| event-queue     | Event queue handles events enqueued in the database.                      |
+| job-queue       | Job queue processing and execution.                                       |
 | listener        | HTTP listener for event submission and debugging.                         |
 | retention       | Data retention and cleanup.                                               |
 | runtime-updates | Configuration changes through Icinga Notifications Web from the database. |
