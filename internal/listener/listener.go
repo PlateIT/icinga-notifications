@@ -125,6 +125,9 @@ func (l *Listener) Run(ctx context.Context) error {
 
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	if err := l.startMetricsServer(ctx); err != nil {
+		return err
+	}
 
 	var listeningFunc func() error
 	if l.useSocket {
