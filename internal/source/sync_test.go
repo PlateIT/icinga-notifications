@@ -15,6 +15,7 @@ import (
 )
 
 func TestSyncConfiguredIsHAIdempotentAndReactivatesDeletedSource(t *testing.T) {
+	testutils.SkipTestIfDBConfigIsMissing(t)
 	daemon.InjectTestConfig(func(configFile *daemon.ConfigFile) { testutils.LoadTestConfig(t, configFile) })
 	db := testutils.GetTestDB(t.Context(), t, &daemon.Config().Database)
 	logger := testutils.GetTestLogging(t).GetChildLogger("source-sync")
