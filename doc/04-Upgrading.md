@@ -63,6 +63,22 @@ systemctl start icinga-notifications
 
 ## Upgrading to Icinga Notifications v1.0
 
+### PostgreSQL schema assertion helper
+
+Development snapshots that already use schema `v1.0` may contain a procedure named
+`assert_correct_schema_version(text)`. Apply `procedure-to-function.sql` as the
+schema owner before using upgrade scripts that call this helper as a function:
+
+```
+psql -v ON_ERROR_STOP=1 -U notifications notifications -f /usr/share/icinga-notifications/schema/pgsql/upgrades/procedure-to-function.sql
+```
+
+This operation checks schema version `v1.0`, replaces only the old procedure and
+commits atomically. It is safe to repeat and does not change the schema version.
+Fresh installations already contain the function. Automatic initialization of an
+empty database does not apply this upgrade to existing databases. Follow the stop,
+backup and restart procedure above; do not apply this file to older schemas.
+
 This Icinga Notifications release is the first stable release of this project. It includes a database schema upgrade,
 which is required to be applied before starting the new version. Please follow the steps in the previous section to
 apply the schema upgrade. Apart from the schema upgrade, there are also some configuration changes, which are described

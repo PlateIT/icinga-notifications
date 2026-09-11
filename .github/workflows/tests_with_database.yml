@@ -125,6 +125,12 @@ jobs:
         run: |
           psql -v ON_ERROR_STOP=1 -U postgres -w -h$ICINGA_NOTIFICATIONS_DATABASE_HOST -d $ICINGA_NOTIFICATIONS_DATABASE_DATABASE < ${{ github.workspace }}/schema/pgsql/schema.sql
 
+      - name: Verify repeatable procedure-to-function upgrade
+        env:
+          PGPASSWORD: ${{ env.ICINGA_NOTIFICATIONS_DATABASE_PASSWORD }}
+        run: |
+          psql -v ON_ERROR_STOP=1 -U postgres -w -h$ICINGA_NOTIFICATIONS_DATABASE_HOST -d $ICINGA_NOTIFICATIONS_DATABASE_DATABASE -f schema/pgsql/tests/procedure-to-function.sql
+
       - name: Download dependencies
         run: go get -v -t -d ./...
 
