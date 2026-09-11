@@ -48,7 +48,7 @@ func YieldNotificationHistory(
 	since int64,
 ) (<-chan NotificationHistoryPair, <-chan error) {
 	query := `
-	SELECT
+	SELECT 
 		nh.event_id,
 		nh.triggered_at,
 		c.full_name AS contact_name,

@@ -10,6 +10,7 @@ on:
 
 jobs:
   docker:
+    if: github.repository_owner == 'Icinga'
     runs-on: ubuntu-latest
     steps:
     - uses: docker/metadata-action@v6
