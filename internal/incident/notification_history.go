@@ -13,17 +13,20 @@ import (
 // NotificationHistory represents a single notification_history database entry,
 // recording the fact that a notification was triggered for a given incident history entry.
 type NotificationHistory struct {
-	ID             int64                    `db:"id"`
-	ObjectID       types.Binary             `db:"object_id"`
-	EventID        types.UUID               `db:"event_id"`
-	ContactID      int64                    `db:"contact_id"`
-	ContactgroupID types.Int                `db:"contactgroup_id"`
-	ScheduleID     types.Int                `db:"schedule_id"`
-	ChannelID      int64                    `db:"channel_id"`
-	IncidentID     types.Int                `db:"incident_id"`
-	EventMessage   string                   `db:"event_message"`
-	State          source.NotificationState `db:"state"`
-	TriggeredAt    types.UnixMilli          `db:"triggered_at"`
+	ID             int64             `db:"id"`
+	ObjectID       types.Binary      `db:"object_id"`
+	EventID        types.UUID        `db:"event_id"`
+	ContactID      int64             `db:"contact_id"`
+	ContactgroupID types.Int         `db:"contactgroup_id"`
+	ScheduleID     types.Int         `db:"schedule_id"`
+	ChannelID      int64             `db:"channel_id"`
+	IncidentID     types.Int         `db:"incident_id"`
+	EventMessage   string            `db:"event_message"`
+	EventSummary   string            `db:"event_summary"`
+	State          NotificationState `db:"state"`
+	TriggeredAt    types.UnixMilli   `db:"triggered_at"`
+	IncidentClosed types.Bool        `db:"incident_closed"`
+	DeliveryResult types.String      `db:"delivery_result"`
 }
 
 // Sync persists the current state of this notification history to the database and retrieves the just inserted
@@ -56,14 +59,15 @@ func YieldNotificationHistory(
 		s.name AS schedule_name,
 		ch.name AS channel_name,
 		nh.event_message,
-		nh.state,
+		nh.event_summary,
+		nh.incident_closed,
 		nh.object_id
     FROM notification_history nh
     LEFT JOIN contact c ON nh.contact_id = c.id AND c.deleted = 'n'
     LEFT JOIN channel ch ON nh.channel_id = ch.id
 	LEFT JOIN contactgroup cg ON nh.contactgroup_id = cg.id
 	LEFT JOIN schedule s ON nh.schedule_id = s.id
-    WHERE nh.triggered_at >= ?`
+    WHERE nh.state = ? AND nh.triggered_at >= ? ORDER BY nh.triggered_at`
 
 	valueCh := make(chan NotificationHistoryPair)
 	errCh := make(chan error, 1) // buffered to avoid goroutine leak if the receiver is not ready to receive errors.
@@ -72,7 +76,7 @@ func YieldNotificationHistory(
 		defer close(valueCh)
 		defer close(errCh)
 
-		rows, err := db.QueryxContext(ctx, db.Rebind(query), since)
+		rows, err := db.QueryxContext(ctx, db.Rebind(query), NotificationStateSent, since)
 		if err != nil {
 			errCh <- fmt.Errorf("cannot query notification_history entries: %w", err)
 			return
@@ -116,11 +120,11 @@ func YieldNotificationHistory(
 // SkippedNotificationHistory represents a single skipped_notification_history database entry, recording the path
 // a notification was skipped for a given incident history entry.
 type SkippedNotificationHistory struct {
-	NotificationID   int64     `db:"notification_history_id"`
-	RuleID           int64     `db:"rule_id"`
-	RuleEscalationID int64     `db:"rule_escalation_id"`
-	ContactgroupID   types.Int `db:"contactgroup_id"`
-	ScheduleID       types.Int `db:"schedule_id"`
+	NotificationID int64     `db:"notification_history_id"`
+	RuleID         int64     `db:"rule_id"`
+	RuleEntryID    int64     `db:"rule_entry_id"`
+	ContactgroupID types.Int `db:"contactgroup_id"`
+	ScheduleID     types.Int `db:"schedule_id"`
 }
 
 type NotificationHistoryPair struct {

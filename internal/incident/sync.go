@@ -9,7 +9,6 @@ import (
 
 	"github.com/icinga/icinga-go-library/database"
 	baseEv "github.com/icinga/icinga-go-library/notifications/event"
-	"github.com/icinga/icinga-go-library/notifications/source"
 	"github.com/icinga/icinga-go-library/types"
 	"github.com/icinga/icinga-notifications/internal/event"
 	"github.com/icinga/icinga-notifications/internal/recipient"
@@ -24,6 +23,7 @@ func (i *Incident) Upsert() any {
 		Severity              baseEv.Severity `db:"severity"`
 		RecoveredAt           types.UnixMilli `db:"recovered_at"`
 		MuteReason            types.String    `db:"mute_reason"`
+		Summary               types.String    `db:"summary"`
 		Message               types.String    `db:"message"`
 		NextEscalationCheckAt types.UnixMilli `db:"next_escalation_check_at"`
 	}{}
@@ -61,12 +61,12 @@ func (i *Incident) AddEscalationTriggered(ctx context.Context, tx *sqlx.Tx, stat
 	return err
 }
 
-// AddEscalationRecipients adds the recipients of the given *rule.Escalation to the incident's recipients list.
+// AddEscalationRecipients adds the recipients of the given *rule.Entry to the incident's recipients list.
 //
 // Each recipient is added to the incident's recipients list with the role RoleRecipient, and a new ContactRow
 // is inserted into the incident_contact table. If a recipient already exists in the incident's recipients list,
 // it is skipped and no new ContactRow is inserted for that recipient.
-func (i *Incident) AddEscalationRecipients(ctx context.Context, tx *sqlx.Tx, escalation *rule.Escalation) error {
+func (i *Incident) AddEscalationRecipients(ctx context.Context, tx *sqlx.Tx, escalation *rule.Entry) error {
 	for _, escalationRecipient := range escalation.Recipients {
 		r := escalationRecipient.Recipient
 		recipientKey := recipient.ToKey(r)
@@ -106,24 +106,29 @@ func (i *Incident) AddRuleMatched(ctx context.Context, tx *sqlx.Tx, r *rule.Rule
 // If the recipient already exists in the incident's recipients list, their role is updated to the new role and a
 // history entry is created to record the change. If the recipient does not exist, they are added to the list with
 // the specified role and a new ContactRow is inserted.
-func (i *Incident) addRecipient(ctx context.Context, tx *sqlx.Tx, r recipient.Recipient, role recipient.Role) error {
+func (i *Incident) addRecipient(ctx context.Context, tx *sqlx.Tx, r recipient.Recipient, role recipient.Role, eventTypes types.StringList) error {
 	recipientKey := recipient.ToKey(r)
 	state, exists := i.Recipients[recipientKey]
 	if exists && state.Role == role {
 		return nil // The recipient already has the desired role, so no changes are needed.
 	}
 
+	oldRole := state.Role
 	if !exists {
-		i.Recipients[recipientKey] = RecipientState{Role: role, IsNew: true}
+		i.Recipients[recipientKey] = RecipientState{Role: role, IsNew: true, EventTypes: eventTypes}
 	} else {
-		if err := i.recordRecipientRoleChange(ctx, tx, r, state.Role, role); err != nil {
-			return err
-		}
 		state.Role = role
+		state.EventTypes = eventTypes
 		i.Recipients[recipientKey] = state
 	}
 
-	cr := &ContactRow{IncidentID: i.Id, Key: recipientKey, Role: role, ChangedAt: types.UnixMilli(time.Now())}
+	// Record the role change in the incident's history table regardless of whether the recipient is new or existing.
+	// This ensures that we have a complete history of role changes for all recipients.
+	if err := i.recordRecipientRoleChange(ctx, tx, r, oldRole, role); err != nil {
+		return err
+	}
+
+	cr := &ContactRow{IncidentID: i.Id, Key: recipientKey, Role: role, EventTypes: eventTypes, ChangedAt: types.UnixMilli(time.Now())}
 	stmt, _ := i.db.BuildUpsertStmt(cr, "id")
 	if _, err := tx.NamedExecContext(ctx, stmt, cr); err != nil {
 		return fmt.Errorf("failed to upsert contact: %w", err)
@@ -155,12 +160,13 @@ func (i *Incident) recordRecipientRoleChange(ctx context.Context, tx *sqlx.Tx, r
 	return nil
 }
 
-// generateNotifications generates incident notification histories of the given recipients.
+// generateNotifications creates a NotificationEntry for every contact+channel pair in contactChannels.
 //
-// This function will just insert NotificationStateSuppressed incident histories and return an empty slice if
-// the incident is muted, otherwise a slice of pending *NotificationEntry(ies) that can be used to update
-// the corresponding histories after the actual notifications have been sent out. The given eventID correlates
-// with the generated notification histories so that they can be traced back to the event that triggered them.
+// Incident-related entries (the event opens/escalates the incident, or any of the contact's origins is
+// incident-related) get an incident_history row. If the incident is muted, that row is Suppressed and no
+// pending entry is returned, unless the origin has BypassSuppression set. Entries that are not incident-related
+// get no incident_history row, but might still carry incident ID and are returned as pending regardless
+// of the mute state.
 //
 // A contact+channel pair selected by multiple origins yields a single pending entry for the first origin,
 // plus one NotificationStateSuperfluous entry per additional origin. Superfluous entries are only recorded
@@ -169,49 +175,83 @@ func (i *Incident) recordRecipientRoleChange(ctx context.Context, tx *sqlx.Tx, r
 // Note: handleUnmute clears i.MuteReason before this function runs, and handleMute sets it after, so a single
 // i.IsMuted() check captures the correct transitional state for mute/unmute and steady-state events alike.
 func (i *Incident) generateNotifications(
-	ctx context.Context, tx *sqlx.Tx, ev *event.Event, contactChannels rule.ContactChannels,
+	ctx context.Context,
+	tx *sqlx.Tx,
+	ev *event.Event,
+	contactChannels rule.ContactChannels,
+	reason notifyReason,
 ) ([]*NotificationEntry, error) {
-	var notificationState source.NotificationState
+	var notifications []*NotificationEntry
 	suppress := i.IsMuted()
-	if suppress {
-		notificationState = source.NotificationStateSuppressed
-	} else {
-		notificationState = source.NotificationStatePending
+
+	summary := ev.Summary
+	if summary == "" {
+		summary = i.Summary
 	}
 
-	var notifications []*NotificationEntry
 	for contact, channelOrigins := range contactChannels {
 		slices.SortStableFunc(channelOrigins, func(a, b rule.ChannelOrigin) int {
-			return cmp.Compare(a.ChannelID, b.ChannelID)
+			// Within the same channel, origins that bypass the suppression come first, so that the
+			// notification is attributed to them and the others are recorded as skipped.
+			return cmp.Or(
+				cmp.Compare(a.ChannelID, b.ChannelID),
+				cmp.Compare(boolToInt(b.BypassSuppression), boolToInt(a.BypassSuppression)),
+			)
 		})
+
+		// Determine if the notification is incident-related. A notification is considered incident-related if
+		// the event is an open or escalate event, or if any of the contact's channel origins are derived from
+		// an incident-related context (e.g., subscribers, escalation recipients, etc.).
+		isIncidentRelated := ev.OpenOrEscalate() || slices.ContainsFunc(channelOrigins, func(origin rule.ChannelOrigin) bool {
+			return origin.IncidentRelated
+		})
+
+		recipientIsNew := slices.ContainsFunc(channelOrigins, func(o rule.ChannelOrigin) bool {
+			return o.BypassSuppression || i.Recipients[o.RecipientKey(contact)].IsNew
+		})
+		effectiveReason := reason.reasonFor(ev.NotificationOnly() && !i.IsNew(), recipientIsNew)
 
 		var lastChannelID int64
 		var notificationOfCurrentChannel *NotificationEntry
 		for _, origin := range channelOrigins {
 			if lastChannelID != origin.ChannelID {
+				// Since origins may bypass the suppression individually, a contact can have both suppressed and
+				// pending channels. Reset the notification of the previous channel, so that further origins of a
+				// suppressed channel aren't recorded as skipped entries of another channel's notification.
+				notificationOfCurrentChannel = nil
 				lastChannelID = origin.ChannelID
-				hr := &HistoryRow{
-					IncidentID:        i.Id,
-					Key:               recipient.ToKey(contact),
-					Time:              types.UnixMilli(time.Now()),
-					Type:              Notified,
-					ChannelID:         types.MakeInt(origin.ChannelID, types.TransformZeroIntToNull),
-					NotificationState: notificationState,
-					Message:           types.MakeString(ev.Message, types.TransformEmptyStringToNull),
-				}
 
-				if err := hr.Sync(ctx, i.db, tx); err != nil {
-					i.logger.Errorw("Failed to insert incident notification history",
-						zap.String("contact", contact.FullName),
-						zap.Bool("incident_muted", i.IsMuted()),
-						zap.Error(err))
-					return nil, err
-				}
+				var hr *HistoryRow
+				// Only incident-related notifications are recorded in the incident history and are subject to the
+				// incident's mute state. Notifications from notification rules are not tied to the incident, so they
+				// are always sent, even if the incident is muted.
+				if isIncidentRelated {
+					state := NotificationStatePending
+					if suppress && !origin.BypassSuppression {
+						state = NotificationStateSuppressed
+					}
+					hr = &HistoryRow{
+						IncidentID:        i.Id,
+						Key:               recipient.ToKey(contact),
+						Time:              types.UnixMilli(time.Now()),
+						Type:              Notified,
+						ChannelID:         types.MakeInt(origin.ChannelID, types.TransformZeroIntToNull),
+						NotificationState: state,
+						Message:           types.MakeString(ev.Message, types.TransformEmptyStringToNull),
+					}
 
-				if suppress {
-					// If the incident is muted, we don't need to create a pending notification entry,
-					// so we can skip to the next origin.
-					continue
+					if err := hr.Sync(ctx, i.db, tx); err != nil {
+						i.logger.Errorw("Failed to insert incident notification history",
+							zap.String("contact", contact.FullName),
+							zap.Bool("incident_muted", i.IsMuted()),
+							zap.Error(err))
+						return nil, err
+					}
+
+					if suppress && !origin.BypassSuppression {
+						// The incident is muted and the origin does not bypass suppression, so we skip it.
+						continue
+					}
 				}
 
 				notificationHistory := NotificationHistory{
@@ -221,16 +261,23 @@ func (i *Incident) generateNotifications(
 					ContactgroupID: types.MakeInt(origin.ContactGroupID, types.TransformZeroIntToNull),
 					ScheduleID:     types.MakeInt(origin.ScheduleID, types.TransformZeroIntToNull),
 					ChannelID:      origin.ChannelID,
-					IncidentID:     types.MakeInt(i.Id),
+					IncidentID:     types.MakeInt(i.Id, types.TransformZeroIntToNull),
 					EventMessage:   ev.Message,
+					EventSummary:   summary,
+					IncidentClosed: types.MakeBool(ev.CloseIncident()),
 				}
 
 				notificationOfCurrentChannel = &NotificationEntry{
-					HistoryRowID: hr.ID,
-					ContactID:    contact.ID,
-					ChannelID:    origin.ChannelID,
-					State:        source.NotificationStatePending,
-					HistoryEntry: notificationHistory,
+					ContactID:         contact.ID,
+					ChannelID:         origin.ChannelID,
+					State:             NotificationStatePending,
+					Reason:            effectiveReason,
+					HistoryEntry:      notificationHistory,
+					IsIncidentRelated: isIncidentRelated,
+				}
+
+				if hr != nil {
+					notificationOfCurrentChannel.HistoryRowID = hr.ID
 				}
 
 				notifications = append(notifications, notificationOfCurrentChannel)
@@ -238,10 +285,10 @@ func (i *Incident) generateNotifications(
 				notificationOfCurrentChannel.SkippedHistoryEntries = append(
 					notificationOfCurrentChannel.SkippedHistoryEntries,
 					SkippedNotificationHistory{
-						RuleID:           origin.RuleID,
-						RuleEscalationID: origin.RuleEscalationID,
-						ContactgroupID:   types.MakeInt(origin.ContactGroupID, types.TransformZeroIntToNull),
-						ScheduleID:       types.MakeInt(origin.ScheduleID, types.TransformZeroIntToNull),
+						RuleID:         origin.RuleID,
+						RuleEntryID:    origin.RuleEntryID,
+						ContactgroupID: types.MakeInt(origin.ContactGroupID, types.TransformZeroIntToNull),
+						ScheduleID:     types.MakeInt(origin.ScheduleID, types.TransformZeroIntToNull),
 					},
 				)
 			}
@@ -249,4 +296,12 @@ func (i *Incident) generateNotifications(
 	}
 
 	return notifications, nil
+}
+
+// boolToInt converts a boolean value to an integer (1 for true, 0 for false).
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

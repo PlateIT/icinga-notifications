@@ -4,6 +4,13 @@ Icinga Notifications exposes an HTTP API for submitting events, retrieving and m
 Please refer to the [Configuration](03-Configuration.md#http-api-configuration) section for details on how to
 configure the HTTP listener and the supported transports.
 
+## Versioning
+
+All HTTP API endpoints, except for the [debug endpoints](#debugging-endpoints), are versioned and prefixed with the
+API version, e.g. `/v1/process-event`. The current version of the HTTP API is `v1`.
+Within a version, the API stays backwards compatible, i.e. existing endpoints, parameters and response fields are
+neither removed nor changed in an incompatible way. Incompatible changes result in a new API version.
+
 ## Authentication
 
 Icinga Notifications identifies the source of an HTTP API request differently depending on the transport used to
@@ -31,48 +38,107 @@ to an arbitrary username, regardless of transport.
 
 ## Process Event
 
-Events can be submitted to Icinga Notifications using the `/process-event` HTTP API endpoint.
+Events can be submitted to Icinga Notifications using the `/v1/process-event` HTTP API endpoint.
 
 After creating a source in Icinga Notifications Web,
 the specified credentials can be used via HTTP Basic Authentication to submit a JSON-encoded
 [`Event`](https://github.com/Icinga/icinga-go-library/blob/main/notifications/event/event.go).
 See [Authentication](#authentication) for how sources are identified across the supported transports.
 
-The `url` field of an event is optional, but if set, it must be an absolute URL such as
-`https://example.com/icingaweb2/icingadb/host?name=example.com`. It is meant to point the notified contact at the
-object in the web interface of the source that submitted the event. Icinga Notifications does not know where that
-interface lives and therefore cannot complete a relative reference, so events carrying one are rejected with a
-`400 Bad Request` status code.
+### Rule Evaluation
 
-Events sent to Icinga Notifications are expected to match rules that describe further event escalations.
-These rules can be configured in Icinga Notifications Web and should be designed to match the `relations` of the
-submitted events. When submitting an event without the expected relations to evaluate the rules, Icinga Notifications
-will reject the request with a `422 Unprocessable Entity` status code and a message describing the missing relations
-when the `X-Icinga-Reject-If-Relations-Incomplete` header is set to `true`. Otherwise, the request will be accepted
-nonetheless, when either there's an existing incident for the event's objects, the ongoing event causes a new incident
-to be opened, or the source have at least one event rule without a configured object filter.
+Events are evaluated against event rules configured in Icinga Notifications Web. There are two types of event rules,
+and the event's `incident` field decides which of them, if any, are evaluated:
 
-Furthermore, the `complete_relations` field of the event can be used to specify which relations or attributes of the
-event should be considered as complete for the purpose of rule evaluation. For instance, if the `complete_relations`
-field contains `host.vars` and `services[*].vars`, Icinga Notifications will not reject the event even if there are
-rules that require custom variables that are not included in the event. This effectively tells Icinga Notifications
-to ignore any missing custom variables because the source has explicitly declared that the event is complete and no
-further information will be provided.
+| `incident` | Rules evaluated    | Effect                                                                                                       |
+|------------|--------------------|--------------------------------------------------------------------------------------------------------------|
+| `true`     | Escalation rules   | Opens a new incident or updates the open one, triggers escalations and notifies recipients.                  |
+| `false`    | Notification rules | Notifies the recipients of matching notification rules right away. No incident is opened, closed or changed. |
+| omitted    | None               | Only updates an already open incident (e.g. its message). Without an open incident, the event is dropped.    |
+
+A rule's object filter is evaluated against the event's `relations`, so rules should be designed to match the
+relations the source submits. Each entry of a notification rule may additionally restrict its recipients by the
+event's `type`, e.g. `event_type=downtime_start`.
+
+For `incident: false` events whose object already has an open incident, that incident's recipients are notified too,
+according to the following rules:
+
+- Recipients added by escalations are always notified.
+- Subscribers and managers are only notified if the event's `type` is one of the event types they chose when
+  subscribing or taking over the incident.
+
+These notifications are recorded in the incident's history and carry the incident in the
+[channel request](10-Channels.md#sendnotification). The incident's state itself stays unchanged.
+
+Muting an incident only silences the notifications that belong to it. Its recipients aren't notified while it's
+muted, and these notifications are recorded as suppressed in the incident's history. Contacts who are only notified
+because of a notification rule are still notified, since those notifications aren't tied to the incident.
+
+### Incomplete Relations
+
+Only events with the `incident` field set are checked for missing relations. If such an event lacks relations that
+the rules of the evaluated type require, Icinga Notifications responds with 422 if the
+`X-Icinga-Reject-If-Relations-Incomplete` header is set to `true`. Without that header, the event is accepted anyway
+if any of the following applies:
+
+- the event has `incident: true`, i.e. it opens or escalates an incident,
+- the event's object already has an open incident, or
+- the source has at least one rule of the evaluated type without an object filter.
+
+Otherwise, it's rejected with 422 as well. The response body lists the missing relations, so the source can
+resubmit the event with them included:
+
+```json
+{"type": "attribute negotiation", "attributes": ["$[\"host\"][\"vars\"][\"foo\"]","$[\"services\"][*][\"vars\"][\"bar\"]"]}
+```
+
+Each entry in `attributes` is a missing relation, written as a normalized JSONPath expression. For example,
+`$["host"]["vars"]["foo"]` is the `foo` custom variable of the host, and the same path can be expressed as
+`host.vars.foo`. To mark such a relation as complete instead of sending it, add it or one of its parents
+(e.g. `host.vars`) to `complete_relations`.
+
+The `complete_relations` field of the event declares relations as complete, even if they don't contain everything
+the rules refer to. For instance, if `complete_relations` contains `host.vars` and `services[*].vars`, the event
+isn't rejected due to missing custom variables, because the source has stated that it has no further variables to send.
+
+### Responses <a id="process-event-responses"></a>
+
+The `/v1/process-event` endpoint returns the following HTTP status codes:
+
+| Status | Meaning                                                                                                 |
+|--------|---------------------------------------------------------------------------------------------------------|
+| 204    | The event was accepted and queued for processing.                                                       |
+| 400    | The body isn't valid JSON, contains unknown fields, or fails validation (e.g. no tags, relative `url`). |
+| 401    | Authentication failed, see [Authentication](#authentication).                                           |
+| 405    | The request method isn't `POST`.                                                                        |
+| 422    | Required relations are missing, see [Incomplete Relations](#incomplete-relations).                      |
+| 500    | The event couldn't be queued. Details are in the server log.                                            |
+
+The `url` field of an event is optional. If set, it must be an absolute URL such as
+`https://example.com/icingaweb2/icingadb/host?name=example.com`, pointing the notified contact at the object in the
+source's web interface. Icinga Notifications doesn't know where that interface lives and can't resolve a relative
+URL, so such events are rejected with `400`.
+
+A `204` HTTP code means the event was accepted and successfully queued. Events that turn out to be invalid during
+processing, such as a severity change without the `incident` field, are dropped and only logged.
+
+### Example Request
 
 An example request to submit an event looks like this:
 
 ```
-curl -v -u 'icingadb:insecureinsecure' -H 'X-Icinga-Reject-If-Relations-Incomplete: true' -d '@-' 'http://localhost:5680/process-event' <<EOF
+curl -v -u 'icingadb:insecureinsecure' -H 'X-Icinga-Reject-If-Relations-Incomplete: true' -d '@-' 'http://localhost:5680/v1/process-event' <<EOF
 {
-  "name": "dummy-809: random fortune",
-  "url": "http://localhost/icingaweb2/icingadb/service?name=random%20fortune&host.name=dummy-809",
+  "incident": true,
+  "name": "example-809: disk /",
+  "url": "http://localhost/icingaweb2/icingadb/service?name=disk%20%2F&host.name=example-809",
   "tags": {
-    "host": "dummy-809",
-    "service": "random fortune"
+    "host": "example-809",
+    "service": "disk /"
   },
-  "type": "state",
-  "severity": "crit",
-  "message": "Something went somewhere very wrong.",
+  "severity": "ok",
+  "summary": "[OK] - Filesystem checks succeeded",
+  "message": "[OK] - Filesystem checks succeeded\n        \\_[OK] - / (ffs)\n                \\_[OK] - Free space absolute: 242 MiB (of 985 MiB)\n                \\_[OK] - Free space percentage: 24.649%\n                \\_[OK] - Inodes free: 97.4923% (151618 of 155518)|'/'=727183360B;826918502.400000;930283315.200000;0;1033648128",
   "complete_relations": [
     "host",
     "services",
@@ -81,16 +147,16 @@ curl -v -u 'icingadb:insecureinsecure' -H 'X-Icinga-Reject-If-Relations-Incomple
   ],
   "relations": {
     "host": {
-      "name": "dummy-809",
-      "display_name": "My Dummy Host",
+      "name": "example-809",
+      "display_name": "Example Host 809",
       "vars": {
         "os": "linux"
       }
     },
     "services": [
       {
-        "name": "random fortune",
-        "display_name": "Random Fortune Service",
+        "name": "disk /",
+        "display_name": "Disk /",
         "vars": {
           "env": "production",
           "team": "devops"
@@ -117,8 +183,9 @@ EOF
 ## Response Format
 
 All responses from the Icinga Notifications HTTP API endpoints are JSON-encoded and follow a consistent structure.
-The only exception to this is the [`/process-event`](#process-event) endpoint, which returns a `204 No Content` status
-code with an empty body in the successful case and a proper HTTP error status code in the error case.
+The only exception to this is the [`/v1/process-event`](#process-event) endpoint, which returns a `204 No Content` status
+code with an empty body in the successful case, see [Responses](#process-event-responses) and a proper HTTP error
+status code in the error case.
 
 The general structure of the response for all other endpoints consists of the following attributes:
 
@@ -142,7 +209,7 @@ attribute containing a JSON object that describes the error.
 
 ## Incidents
 
-The `/incidents` Icinga Notifications HTTP API endpoint allows sources to query and modify a list of open incidents.
+The `/v1/incidents` Icinga Notifications HTTP API endpoint allows sources to query and modify a list of open incidents.
 Incidents can be retrieved by sending a `GET` request to the endpoint, and can be modified by sending a `POST` request
 with the desired changes. The endpoint requires a `filter` query parameter to specify which incidents the source wants
 to retrieve or modify. Please refer to the [API Filtering](#api-filtering) section for more details on how to construct
@@ -152,7 +219,7 @@ See [Authentication](#authentication) for the transport-specific rules that appl
 
 ### Getting Incidents
 
-In order to retrieve incidents, one can send a `GET` request to the `/incidents` endpoint with the appropriate `filter`
+In order to retrieve incidents, one can send a `GET` request to the `/v1/incidents` endpoint with the appropriate `filter`
 query parameter. In successful cases, the response result as described in the [Response Format](#response-format)
 section will contain the following attributes for each incident that matches the filter:
 
@@ -160,7 +227,7 @@ section will contain the following attributes for each incident that matches the
 |-------------|-----------------------------------------------------------------------------------------------|
 | is_muted    | A boolean indicating whether the incident is muted or not.                                    |
 | object_tags | A dictionary containing the object ID tags associated with the incident.                      |
-| severity    | The severity level of the incident (e.g., `crit`, `err`, `warning`, etc.).                    |
+| severity    | The severity level of the incident, i.e., `ok`, `warning`, `error` or `critical`.             |
 
 For error cases, the response result will contain the following attributes:
 
@@ -173,15 +240,15 @@ specific Icinga DB environment. The following example shows how to retrieve all 
 `08434a503ec43bb67cd380c5d0b6217a1ebf924b` environment:
 
 ```
-$ curl -u 'example:insecureinsecure' 'http://localhost:5680/incidents' -G --data-urlencode 'filter={"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b"}'
+$ curl -u 'example:insecureinsecure' 'http://localhost:5680/v1/incidents' -G --data-urlencode 'filter={"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b"}'
 ...
-{"status":"success","result":{"is_muted":false,"object_tags":{"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b","host":"mailserver","service":"filesystem"},"severity":"crit"}}
-{"status":"success","result":{"is_muted":true,"object_tags":{"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b","host":"database","service":"load"},"severity":"err"}}
+{"status":"success","result":{"is_muted":false,"object_tags":{"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b","host":"mailserver","service":"filesystem"},"severity":"critical"}}
+{"status":"success","result":{"is_muted":true,"object_tags":{"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b","host":"database","service":"load"},"severity":"error"}}
 ```
 
 ### Modifying Incidents
 
-Modifying incidents can be done by sending a `POST` request to the `/incidents` endpoint with the appropriate
+Modifying incidents can be done by sending a `POST` request to the `/v1/incidents` endpoint with the appropriate
 `filter` query parameter and a JSON-encoded body that describes the desired changes. The request body should be a JSON
 object that contains the attributes to be modified, set to their new values. The list of attributes that currently can
 be modified are listed in the following table.
@@ -191,7 +258,7 @@ be modified are listed in the following table.
 | close     | Closes the incident matching the filter. This attribute can only be set to `true`. |
 | message   | Updates the incident's message. This attribute can be set to any string value.     |
 
-As opposed to the `/process-event` endpoint, closing an incident this way will not have any side effects other than
+As opposed to the `/v1/process-event` endpoint, closing an incident this way will not have any side effects other than
 marking the incident as closed. For instance, it will not trigger any notifications or trigger any escalations. Also,
 note that the `close` attribute can only be set to `true`, otherwise Icinga Notifications will reject the request with
 a 400 status code. The `message` attribute can be used to update the incident's message without any side effects, as
@@ -212,7 +279,7 @@ The following example shows how to close the incident for the `mailserver` host 
 `08434a503ec43bb67cd380c5d0b6217a1ebf924b` environment:
 
 ```
-$ curl -u 'example:insecureinsecure' -X POST 'http://localhost:5680/incidents' -G --data-urlencode 'filter={"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b","host":"mailserver","service":"filesystem"}' -d '@-' <<EOF
+$ curl -u 'example:insecureinsecure' -X POST 'http://localhost:5680/v1/incidents' -G --data-urlencode 'filter={"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b","host":"mailserver","service":"filesystem"}' -d '@-' <<EOF
 {
   "close": true
 }
@@ -224,7 +291,7 @@ attribute set to the new message. For instance, the following example shows how 
 for the `database` host and `load` service in the `08434a503ec43bb67cd380c5d0b6217a1ebf924b` environment:
 
 ```
-$ curl -u 'example:insecureinsecure' -X POST 'http://localhost:5680/incidents' -G --data-urlencode 'filter={"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b","host":"database","service":"load"}' -d '@-' <<EOF
+$ curl -u 'example:insecureinsecure' -X POST 'http://localhost:5680/v1/incidents' -G --data-urlencode 'filter={"environment":"08434a503ec43bb67cd380c5d0b6217a1ebf924b","host":"database","service":"load"}' -d '@-' <<EOF
 {
   "message": "The load on the database server has returned to normal."
 }
@@ -248,23 +315,25 @@ some server-side error.
 
 See [Authentication](#authentication) for the transport-specific rules that apply here.
 
-In order to retrieve notification history entries, send a `GET` request to the `/notification-history` endpoint
+In order to retrieve notification history entries, send a `GET` request to the `/v1/notification-history` endpoint
 with the query parameters `filter` described in [API Filtering](#api-filtering) and `since` set to a Unix timestamp in
-milliseconds. Only entries whose `triggered_at` is greater than or equal to this value are returned.
+milliseconds. Only entries whose `triggered_at` is greater than or equal to this value are returned. Failed notification
+attempts are not included, i.e. the response only contains notifications that were successfully sent to a contact.
 
 In the successful case with matching notification history entries, the [response result](#response-format) will contain
 the following attributes for each notification history entry:
 
-| Attribute         | Description                                                                                |
-|-------------------|--------------------------------------------------------------------------------------------|
-| event_id          | Hex-encoded ID of the event that caused the notification to be triggered.                  |
-| triggered_at      | Unix timestamp in milliseconds at which the notification attempt was made.                 |
-| contact_name      | Full name of the contact the notification was sent to.                                     |
-| contactgroup_name | Name of the contact group the contact was resolved from, if any.                           |
-| schedule_name     | Name of the on-call schedule the contact was resolved from, if any.                        |
-| channel_name      | Name of the channel used to deliver the notification.                                      |
-| event_message     | The message of the event that triggered the notification.                                  |
-| state             | The state of the notification attempt, either `sent` or `failed`.                          |
+| Attribute         | Description                                                                                                 |
+|-------------------|-------------------------------------------------------------------------------------------------------------|
+| event_id          | Hex-encoded ID of the event that caused the notification to be triggered.                                   |
+| triggered_at      | Unix timestamp in milliseconds at which the notification was sent.                                          |
+| contact_name      | Full name of the contact the notification was sent to.                                                      |
+| contactgroup_name | Name of the contact group the contact was resolved from, if any.                                            |
+| schedule_name     | Name of the on-call schedule the contact was resolved from, if any.                                         |
+| channel_name      | Name of the channel used to deliver the notification.                                                       |
+| event_message     | The message of the event that triggered the notification.                                                   |
+| event_summary     | The summary of the event that triggered the notification.                                                   |
+| incident_closed   | A boolean indicating whether the associated incident was closed at the time the notification was triggered. |
 
 In error cases, the response result will contain the following attributes:
 
@@ -280,16 +349,16 @@ The following example shows how to retrieve all notification history entries rec
 2026-01-01T00:00:00Z (`1767225600000`):
 
 ```
-$ curl -u 'example:insecureinsecure' 'http://localhost:5680/notification-history?since=1767225600000' -G --data-urlencode 'filter={"host":"test-host"}'
+$ curl -u 'example:insecureinsecure' 'http://localhost:5680/v1/notification-history?since=1767225600000' -G --data-urlencode 'filter={"host":"test-host"}'
 ...
-{"status":"success","result":{"event_id":"b56665fc-70f1-48b9-a19c-b15beeb0152e","triggered_at":1788518901863,"contact_name":"Jane Doe","contactgroup_name":null,"schedule_name":"On-Call","channel_name":"email","event_message":"PING OK - Packet loss = 0%, RTA = 0.09 ms","state":"sent"}}
-{"status":"success","result":{"event_id":"48bb1a43-4066-4b69-a14f-7d3d1fd76927","triggered_at":1788518901865,"contact_name":"Jane Doe","contactgroup_name":null,"schedule_name":"On-Call","channel_name":"email","event_message":"LOAD OK - total load average: 1.93, 0.98, 0.66","state":"sent"}}
+{"status":"success","result":{"event_id":"b56665fc-70f1-48b9-a19c-b15beeb0152e","triggered_at":1788518901863,"contact_name":"Jane Doe","contactgroup_name":null,"schedule_name":"On-Call","channel_name":"email","event_message":"PING OK - Packet loss = 0%, RTA = 0.09 ms","event_summary":"PING OK - Packet loss = 0%, RTA = 0.09 ms","incident_closed":false}}
+{"status":"success","result":{"event_id":"48bb1a43-4066-4b69-a14f-7d3d1fd76927","triggered_at":1788518901865,"contact_name":"Jane Doe","contactgroup_name":null,"schedule_name":"On-Call","channel_name":"email","event_message":"LOAD OK - total load average: 1.93, 0.98, 0.66","event_summary":"LOAD OK - total load average: 1.93, 0.98, 0.66","incident_closed":false}}
 ```
 
 ## API Filtering
 
 Some of the Icinga Notifications API endpoints require to explicitly specify which objects the request should be
-filtered for. For instance, the `/incidents` endpoint requires a `filter` query parameter to specify which incidents
+filtered for. For instance, the `/v1/incidents` endpoint requires a `filter` query parameter to specify which incidents
 it should either retrieve or modify. The `filter` query parameter is a JSON-encoded object that describes the
 filtering criteria. The filter syntax and semantics are as follows:
 

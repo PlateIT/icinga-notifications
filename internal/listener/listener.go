@@ -15,16 +15,22 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/icinga/icinga-go-library/backoff"
 	"github.com/icinga/icinga-go-library/database"
 	"github.com/icinga/icinga-go-library/logging"
 	"github.com/icinga/icinga-go-library/notifications"
 	baseEv "github.com/icinga/icinga-go-library/notifications/event"
 	"github.com/icinga/icinga-go-library/notifications/source"
+	"github.com/icinga/icinga-go-library/retry"
+	"github.com/icinga/icinga-go-library/types"
 	"github.com/icinga/icinga-notifications/internal"
+	"github.com/icinga/icinga-notifications/internal/channel"
 	"github.com/icinga/icinga-notifications/internal/config"
 	"github.com/icinga/icinga-notifications/internal/daemon"
 	"github.com/icinga/icinga-notifications/internal/event"
 	"github.com/icinga/icinga-notifications/internal/incident"
+	"github.com/icinga/icinga-notifications/internal/object"
+	"github.com/icinga/icinga-notifications/internal/rule"
 	"github.com/jmoiron/sqlx"
 	"go.uber.org/zap"
 )
@@ -76,9 +82,9 @@ func NewListener(db *database.DB, runtimeConfig *config.RuntimeConfig, logs *log
 	debugMux.HandleFunc("/dump-rules", l.DumpRules)
 
 	l.mux.Handle("/debug/", http.StripPrefix("/debug", l.requireDebugAuth(debugMux)))
-	l.mux.HandleFunc("/process-event", l.ProcessEvent)
-	l.mux.HandleFunc("/incidents", l.IncidentsHandler)
-	l.mux.HandleFunc("/notification-history", l.NotificationHistoryHandler)
+	l.mux.HandleFunc("/v1/process-event", l.ProcessEvent)
+	l.mux.HandleFunc("/v1/incidents", l.IncidentsHandler)
+	l.mux.HandleFunc("/v1/notification-history", l.NotificationHistoryHandler)
 	return l
 }
 
@@ -330,7 +336,7 @@ func (l *Listener) sourceFromAuthOrAbort(w http.ResponseWriter, r *http.Request)
 
 		l.logger.Debugw(
 			"Source is authenticated via socket connection",
-			zap.String("source_name", src.Name),
+			zap.Object("source", src),
 			zap.String("username", username),
 		)
 	} else {
@@ -362,7 +368,7 @@ func (l *Listener) sourceFromAuthOrAbort(w http.ResponseWriter, r *http.Request)
 
 			l.logger.Debugw(
 				"Source is authenticated via a TLS client certificate",
-				zap.String("source_name", src.Name),
+				zap.Object("source", src),
 				zap.String("common_name", clientCert.Subject.CommonName),
 			)
 		} else {
@@ -380,7 +386,7 @@ func (l *Listener) sourceFromAuthOrAbort(w http.ResponseWriter, r *http.Request)
 
 			l.logger.Debugw(
 				"Source is authenticated via HTTP Basic Auth",
-				zap.String("source_name", src.Name),
+				zap.Object("source", src),
 				zap.String("username", authUser),
 			)
 		}
@@ -398,7 +404,7 @@ func (l *Listener) abort(w http.ResponseWriter, statusCode int, src *config.Sour
 
 	logger := l.logger.With(zap.Int("status_code", statusCode), zap.String("message", msg))
 	if src != nil {
-		logger = logger.With(zap.String("source", src.Name))
+		logger = logger.With(zap.Object("source", src))
 	}
 
 	http.Error(w, msg, statusCode)
@@ -438,14 +444,19 @@ func (l *Listener) ProcessEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	l.logger.Debugw("Received event", zap.String("source", src.Name), zap.Object("event", &ev))
+	l.logger.Debugw("Received event", zap.Object("source", src), zap.Object("event", &ev))
 
-	// Submitting an event without the "incident" field won't cause any new event rules to be evaluated or
-	// escalations to be triggered, but only updates the state of an existing incident without a severity change.
-	if ev.OpenOrEscalate() {
-		filterColumns, hasRulesWithoutFilter := l.runtimeConfig.GetRulesFilterColumnsForSource(src)
+	// Only events with an explicit "incident" flag evaluate rules (escalation rules for true,
+	// notification rules for false), so only those need their relations checked.
+	if ev.Incident.Valid {
+		ruleType := rule.TypeEscalation
+		if ev.NotificationOnly() {
+			ruleType = rule.TypeNotification
+		}
+
+		filterColumns, hasRulesWithoutFilter := l.runtimeConfig.GetRulesFilterColumnsForSource(src, ruleType)
 		missingRelations := ev.ExtractMissingRelations(filterColumns...)
-		if len(missingRelations) > 0 && ShouldRejectRequestOnIncompleteRelations(r, hasRulesWithoutFilter) {
+		if len(missingRelations) > 0 && l.shouldRejectRequestOnIncompleteRelations(r, &ev, hasRulesWithoutFilter) {
 			l.sendMissingAttrsError(w, src, missingRelations)
 			return
 		}
@@ -468,8 +479,8 @@ func (l *Listener) ProcessEvent(w http.ResponseWriter, r *http.Request) {
 
 	if err := event.Enqueue(ctx, l.db, &ev); err != nil {
 		l.logger.Errorw("Failed to enqueue event into event queue",
-			zap.String("source", src.Name),
 			zap.String("event_name", ev.Name),
+			zap.Object("source", src),
 			zap.Error(err))
 
 		l.abort(w, http.StatusInternalServerError, src, "internal error: see server logs for details")
@@ -477,13 +488,13 @@ func (l *Listener) ProcessEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	l.logger.Debugw("Successfully enqueued event for future processing",
-		zap.String("source", src.Name),
-		zap.String("event_name", ev.Name))
+		zap.String("event_name", ev.Name),
+		zap.Object("source", src))
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// IncidentsHandler handles GET and POST requests to the /incidents endpoint.
+// IncidentsHandler handles GET and POST requests to the /v1/incidents endpoint.
 //
 // It performs authentication using HTTP Basic Auth and delegates the actual handling to [Listener.getIncidents]
 // for GET requests and [Listener.modifyIncident] for POST requests. If the request method is neither GET nor POST,
@@ -522,7 +533,7 @@ func (l *Listener) IncidentsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// getIncidentsHandler handles GET requests to the /incidents endpoint.
+// getIncidentsHandler handles GET requests to the /v1/incidents endpoint.
 //
 // It retrieves all the current open incidents, applies any filters provided in the query
 // parameters, and streams the filtered incidents back to the client in NDJSON format.
@@ -551,11 +562,11 @@ func (l *Listener) getIncidentsHandler(w http.ResponseWriter, r *http.Request, s
 
 	pairCh, errCh := incident.YieldLight(r.Context(), l.db, l.logs, l.runtimeConfig)
 	if err := StreamJsonResults(r.Context(), w, pairCh, errCh, opts...); err != nil {
-		l.logger.Debugw("Error streaming get incidents response", zap.String("source", src.Name), zap.Error(err))
+		l.logger.Debugw("Error streaming get incidents response", zap.Object("source", src), zap.Error(err))
 	}
 }
 
-// modifyIncidentsHandler handles POST requests to the /incidents endpoint.
+// modifyIncidentsHandler handles POST requests to the /v1/incidents endpoint.
 //
 // It retrieves all the current open incidents, applies any filters provided in the query params, and modifies the
 // filtered incidents based on the JSON body of the request. The JSON body can contain a "message" field to update
@@ -576,6 +587,7 @@ func (l *Listener) modifyIncidentsHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	now := time.Now()
 	opts := []StreamOpt[incident.Pair]{
 		WithSendHeaderEarly[incident.Pair](),
 		WithOnError[incident.Pair](errF),
@@ -595,7 +607,7 @@ func (l *Listener) modifyIncidentsHandler(w http.ResponseWriter, r *http.Request
 							pair.Incident.Message = attrs.Message
 						}
 						if attrs.Close.Valid {
-							if err := pair.Incident.Close(ctx, tx); err != nil {
+							if err := pair.Incident.Close(ctx, tx, types.UnixMilli(now)); err != nil {
 								return err
 							}
 						}
@@ -607,7 +619,7 @@ func (l *Listener) modifyIncidentsHandler(w http.ResponseWriter, r *http.Request
 					// The incident was closed in the meantime, so we cannot modify it anymore!
 
 				case err != nil:
-					l.logger.Errorw("Failed to modify incident", zap.String("source", src.Name), zap.Error(err))
+					l.logger.Errorw("Failed to modify incident", zap.Object("source", src), zap.Error(err))
 					return source.Response[source.ModifiedIncidentResp]{
 						Status: source.ResponseStatusError,
 						Result: source.ModifiedIncidentResp{
@@ -618,6 +630,14 @@ func (l *Listener) modifyIncidentsHandler(w http.ResponseWriter, r *http.Request
 						},
 					}, nil
 				default:
+					if attrs.Close.Valid {
+						if err := channel.DeleteStateByIncidentID(r.Context(), l.db, pair.Incident.Id); err != nil {
+							l.logger.Warnw("Failed to delete channel state for closed incident",
+								zap.Object("source", src),
+								zap.Error(err))
+						}
+					}
+
 					return source.Response[source.ModifiedIncidentResp]{
 						Status: source.ResponseStatusSuccess,
 						Result: source.ModifiedIncidentResp{ObjectTags: pair.Object.Tags},
@@ -630,11 +650,11 @@ func (l *Listener) modifyIncidentsHandler(w http.ResponseWriter, r *http.Request
 
 	pairCh, errCh := incident.YieldLight(r.Context(), l.db, l.logs, l.runtimeConfig)
 	if err := StreamJsonResults(r.Context(), w, pairCh, errCh, opts...); err != nil {
-		l.logger.Debugw("Error streaming modify incidents response", zap.String("source", src.Name), zap.Error(err))
+		l.logger.Debugw("Error streaming modify incidents response", zap.Object("source", src), zap.Error(err))
 	}
 }
 
-// NotificationHistoryHandler handles GET requests to the /notification-history endpoint.
+// NotificationHistoryHandler handles GET requests to the /v1/notification-history endpoint.
 func (l *Listener) NotificationHistoryHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		l.abort(w, http.StatusMethodNotAllowed, nil, "GET required")
@@ -688,7 +708,7 @@ func (l *Listener) NotificationHistoryHandler(w http.ResponseWriter, r *http.Req
 
 	historyEntryCh, errCh := incident.YieldNotificationHistory(r.Context(), l.db, parsedSince)
 	if err := StreamJsonResults(r.Context(), w, historyEntryCh, errCh, opts...); err != nil {
-		l.logger.Debugw("Error streaming get incidents response", zap.String("source", src.Name), zap.Error(err))
+		l.logger.Debugw("Error streaming get incidents response", zap.Object("source", src), zap.Error(err))
 	}
 }
 
@@ -704,10 +724,10 @@ func (l *Listener) createStreamErrFunc(r *http.Request, w http.ResponseWriter, s
 		// still normally closes the connection, the context will be canceled and the DB query will return that
 		// error. In that case, there is no client to send a response to, so debug log it and be done with it.
 		if errors.Is(err, context.Canceled) {
-			l.logger.Debugw("Client disconnected prematurely", zap.String("source", src.Name), zap.Error(err))
+			l.logger.Debugw("Client disconnected prematurely", zap.Object("source", src), zap.Error(err))
 			return
 		}
-		l.logger.Warnw(fmt.Sprintf("Error processing %s request", namePlural), zap.String("source", src.Name), zap.Error(err))
+		l.logger.Warnw(fmt.Sprintf("Error processing %s request", namePlural), zap.Object("source", src), zap.Error(err))
 
 		var code int
 		var errState source.ErrorState
@@ -726,7 +746,7 @@ func (l *Listener) createStreamErrFunc(r *http.Request, w http.ResponseWriter, s
 			*wroteHeader = true
 			l.abort(w, code, src, "%s", errState.Error)
 		} else if err := enc.Encode(source.Response[source.ErrorState]{Status: source.ResponseStatusError, Result: errState}); err != nil {
-			l.logger.Warnw("Error serializing error response", zap.String("source", src.Name), zap.Error(err))
+			l.logger.Warnw("Error serializing error response", zap.Object("source", src), zap.Error(err))
 		}
 	}
 }
@@ -853,7 +873,7 @@ func (l *Listener) DumpRules(w http.ResponseWriter, r *http.Request) {
 func (l *Listener) sendMissingAttrsError(w http.ResponseWriter, src *config.Source, missingAttrs []string) {
 	l.logger.Debugw(
 		"Event is missing attributes required for rule evaluation",
-		zap.String("source", src.Name),
+		zap.Object("source", src),
 		zap.Strings("missing_attributes", missingAttrs),
 	)
 
@@ -871,20 +891,43 @@ func (l *Listener) sendMissingAttrsError(w http.ResponseWriter, src *config.Sour
 	}
 }
 
-// ShouldRejectRequestOnIncompleteRelations determines whether a request with incomplete relations should be rejected.
+// shouldRejectRequestOnIncompleteRelations reports whether an event lacking some of the relations required by
+// the rules of the evaluated type must be rejected.
 //
-// This function always returns true if the client explicitly requested to reject such events by setting the
-// [notifications.XIcingaRejectIfRelationsIncomplete] HTTP header. Otherwise, if there are rules without a filter,
-// it returns false as such rules match unconditionally and thus don't necessarily require the missing relations.
+// The event is always rejected if the client set the [notifications.XIcingaRejectIfRelationsIncomplete] HTTP
+// header to "true". Otherwise, it is accepted if any of the following applies:
+//   - hasRulesWithoutFilter is true, i.e., the source has at least one rule of the evaluated type without an
+//     object filter, which matches the event regardless of its relations.
+//   - The event opens or escalates an incident ([baseEv.Event.OpenOrEscalate]).
+//   - The event's object already has an open incident, whose recipients might still be notified.
 //
-// Note that this function assumes that it's guarded by a [baseEv.Event.OpenOrEscalate] check, since only
-// events that open or escalate an incident are subject to relation completeness checks in the first place.
-func ShouldRejectRequestOnIncompleteRelations(r *http.Request, hasRulesWithoutFilter bool) bool {
+// If looking up the object's open incident fails, the error is logged and the event is accepted, so that it
+// isn't dropped because of a database error.
+//
+// Callers must only use this for events with the incident flag set, as all other events don't evaluate any
+// rules and are therefore never checked for relation completeness.
+func (l *Listener) shouldRejectRequestOnIncompleteRelations(r *http.Request, ev *event.Event, hasRulesWithoutFilter bool) bool {
 	if r.Header.Get(notifications.XIcingaRejectIfRelationsIncomplete) == "true" {
 		return true
 	}
-	if hasRulesWithoutFilter {
+	if hasRulesWithoutFilter || ev.OpenOrEscalate() {
 		return false
 	}
-	return true
+	var exists bool
+	incidentQ := `SELECT EXISTS (SELECT 1 FROM incident WHERE object_id = ? AND recovered_at IS NULL)`
+	objectID := object.ID(ev.Tags)
+	err := retry.WithBackoff(
+		r.Context(),
+		func(ctx context.Context) error {
+			return l.db.GetContext(ctx, &exists, l.db.Rebind(incidentQ), objectID)
+		},
+		retry.Retryable,
+		backoff.DefaultBackoff,
+		retry.Settings{Timeout: 5 * time.Second})
+	if err != nil {
+		l.logger.Warnw("Failed to check for existing open incident for relation completeness check",
+			zap.Stringer("object_id", objectID), zap.Error(err))
+		return false
+	}
+	return !exists
 }

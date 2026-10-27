@@ -19,14 +19,10 @@ the module name in uppercase followed by an underscore, and the option name in u
 The hyphens in the names are to be replaced by underscores.
 For example, to set the database host, the `ICINGA_NOTIFICATIONS_DATABASE_HOST` environment variable is used.
 
-For containerized greenfield installations, `ICINGA_NOTIFICATIONS_DATABASE_AUTO_IMPORT=true`
-initializes a completely empty database from the schema below
-`ICINGA_NOTIFICATIONS_DATABASE_SCHEMA_DIR` (default:
-`/usr/share/icinga-notifications/schema`). It never upgrades an existing
-schema; upgrades remain an explicit operator action.
-Initialization is serialized in the database, so multiple HA replicas may
-start concurrently. PostgreSQL uses a transaction-scoped advisory lock;
-MySQL/MariaDB uses a dedicated connection with a named session lock.
+For an empty container database, use the upstream command-line flag
+`--database-auto-import`. The optional `--database-schema-dir` selects the
+schema root. Existing databases require the documented, ordered migrations.
+Initialization is serialized using the upstream database schema lock.
 
 Passwords can be set directly or stored in a separate file, referenced via the `password_file` YAML key or `PASSWORD_FILE` environment variable.
 Only one of these two options can be used.
@@ -285,6 +281,19 @@ ICINGA_NOTIFICATIONS_LOGGING_OPTIONS=database:error,listener:debug
 | listener        | HTTP listener for event submission and debugging.                         |
 | retention       | Data retention and cleanup.                                               |
 | runtime-updates | Configuration changes through Icinga Notifications Web from the database. |
+
+## Command Line Flags
+
+Icinga Notifications supports the following command line flags.
+
+| Flag                     | Description                                                                                                                                   |
+|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| `-c`, `--config`         | Path to the configuration file.                                                                                                               |
+| `-h`, `--help`           | Print a help message listing all flags and exit.                                                                                              |
+| `--version`              | Print version information and exit.                                                                                                           |
+| `--database-auto-import` | Import the database schema on startup if none exists. Has no effect if a schema already exists.                                               |
+| `--database-schema-dir`  | Directory with `mysql/schema.sql` and `pgsql/schema.sql` for `--database-auto-import`. Defaults to `/usr/share/icinga-notifications/schema/`. |
+| `--database-schema-only` | Exit after checking or importing the database schema, without starting the daemon.                                                            |
 
 ## Appendix
 

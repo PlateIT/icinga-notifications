@@ -52,7 +52,7 @@ user. Please modify them for your setup and the schema upgrade you want to apply
   ```
 * PostgreSQL:
   ```
-  psql -U notifications notifications < /usr/share/icinga-notifications/schema/pgsql/upgrades/0.1.2.sql
+  psql -v ON_ERROR_STOP=1 -U notifications notifications < /usr/share/icinga-notifications/schema/pgsql/upgrades/0.1.2.sql
   ```
 
 Afterwards, restart Icinga Notifications.
@@ -62,22 +62,6 @@ systemctl start icinga-notifications
 ```
 
 ## Upgrading to Icinga Notifications v1.0
-
-### PostgreSQL schema assertion helper
-
-Development snapshots that already use schema `v1.0` may contain a procedure named
-`assert_correct_schema_version(text)`. Apply `procedure-to-function.sql` as the
-schema owner before using upgrade scripts that call this helper as a function:
-
-```
-psql -v ON_ERROR_STOP=1 -U notifications notifications -f /usr/share/icinga-notifications/schema/pgsql/upgrades/procedure-to-function.sql
-```
-
-This operation checks schema version `v1.0`, replaces only the old procedure and
-commits atomically. It is safe to repeat and does not change the schema version.
-Fresh installations already contain the function. Automatic initialization of an
-empty database does not apply this upgrade to existing databases. Follow the stop,
-backup and restart procedure above; do not apply this file to older schemas.
 
 This Icinga Notifications release is the first stable release of this project. It includes a database schema upgrade,
 which is required to be applied before starting the new version. Please follow the steps in the previous section to
@@ -99,7 +83,7 @@ has been renamed to `channels_dir` as well.
 
 The `icingaweb2-url` global option has been dropped without replacement and you will have to remove it from your config.
 Icinga Notifications no longer builds any URLs on its own and can therefore no longer complete an event's relative `url`.
-The field itself stays optional, but if an event carries one, `/process-event` now rejects anything but an absolute URL.
+The field itself stays optional, but if an event carries one, `/v1/process-event` now rejects anything but an absolute URL.
 If you are running a source that submits relative URLs, upgrade it to the version that submits absolute ones before
 upgrading Icinga Notifications.
 
